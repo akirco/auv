@@ -1,0 +1,20 @@
+[package]
+name = "auv"
+version = "0.1.0"
+edition = "2024"
+description = "AUV is a media player written in Rust.(fltk, cpal, ffmpeg-next)"
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18.1"
+ffmpeg-next = "8.1.0"
+fltk = { version = "1.5.23", features = ["enable-glwindow", "use-wayland"] }
+gl = "0.14.0"
+ringbuf = "0.5.1"
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 1
