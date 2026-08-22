@@ -65,7 +65,7 @@ fn main() -> Result<()> {
     let sources = util::parse_sources(&args[1..])?;
     if sources.is_empty() {
         return Err(anyhow::anyhow!(
-            "Usage: auv <file_or_url>... [-p|--playlist <list.txt>]\nPage links (bilibili, youtube, ...) require yt-dlp installed"
+            "Usage: auv <file_or_url>... [-p|--playlist <list.txt>]\nPage links (bilibili, youtube, ...) require yt-dlp installed;\nytdlp options like --cookies/--cookies-from-browser go into ~/.config/yt-dlp/config"
         ));
     }
 
