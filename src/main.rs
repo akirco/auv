@@ -65,7 +65,7 @@ fn main() -> Result<()> {
     let sources = util::parse_sources(&args[1..])?;
     if sources.is_empty() {
         return Err(anyhow::anyhow!(
-            "Usage: auv <file_or_url>... [-p|--playlist <list.txt>]"
+            "Usage: auv <file_or_url>... [-p|--playlist <list.txt>]\nPage links (bilibili, youtube, ...) require yt-dlp installed"
         ));
     }
 
@@ -105,9 +105,10 @@ fn main() -> Result<()> {
     let mut gl_ready = false;
 
     for source in &sources {
-        // 每个源独立打开一次 ictx（demux 线程会整体消费它）
-        let ictx = match ffmpeg_next::format::input(source) {
-            Ok(ictx) => ictx,
+        // 每个源独立打开一次 ictx（demux 线程会整体消费它）；
+        // 页面链接（B 站等）经 yt-dlp 桥接时需持有子进程直到本源播完
+        let (ictx, mut ytdlp_child) = match util::open_input(source) {
+            Ok(v) => v,
             Err(e) => {
                 eprintln!("Skipping {}: {}", source, e);
                 continue;
@@ -330,6 +331,9 @@ fn main() -> Result<()> {
                 }
             }
         }
+
+        // 收尾本源的 yt-dlp 子进程（自然结束则回收，提前退出则终止）
+        util::reap_child(&mut ytdlp_child);
 
         // 用户关闭了窗口：终止整个播放列表
         if !win.visible() {
