@@ -137,6 +137,8 @@ fn main() -> Result<()> {
             win.show();
 
             win.make_current();
+            // 呈现节奏锁定显示器刷新率，避免无谓的满速 present 抢占 GPU
+            win.set_swap_interval(1);
             gl::load_with(|s| win.get_proc_address(s) as *const _);
             let rs = unsafe { render::setup_opengl() };
 
@@ -211,18 +213,28 @@ fn main() -> Result<()> {
                         for sample in &mut data[filled..] {
                             *sample = 0.0; // 缓冲区空时输出静音，防止爆音
                         }
-                        // 以声卡实际播放过的帧数作为主时钟：即使缓冲下溢
-                        // 也按真实播放时间推进，避免时钟冻结导致视频追不上
-                        samples_played_cb.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        // 只把实际交付的样本计入主时钟：起播缓冲期时钟不空转，
+                        // 视频从 pts≈0 起同步；中途下溢时时钟暂停，视频等待
+                        // 而非丢帧，保持音画对齐（无声卡时退回系统时钟）
+                        samples_played_cb.fetch_add(filled as u64, Ordering::Relaxed);
                     },
                     |err| eprintln!("Audio Stream Error: {}", err),
                     None,
                 );
-                if let Ok(s) = stream {
-                    let _ = s.play();
-                    (Some(s), Some(producer))
-                } else {
-                    (None, None)
+                match stream {
+                    // 播放启动失败时按无音频路径走（producer 一并丢弃），
+                    // 否则环形缓冲永不排空会让视频线程死等
+                    Ok(s) => match s.play() {
+                        Ok(()) => (Some(s), Some(producer)),
+                        Err(e) => {
+                            eprintln!("Audio output failed to start: {}", e);
+                            (None, None)
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Audio output init failed: {}", e);
+                        (None, None)
+                    }
                 }
             } else {
                 (None, None)
@@ -233,8 +245,11 @@ fn main() -> Result<()> {
         *paused.0.lock().unwrap() = false;
         paused.1.notify_all();
 
-        // 本源的通道与线程
-        let (tx, rx) = app::channel::<Message>();
+        // 本源的通道与线程。
+        // 有界 sync_channel：UI 线程卡顿（如合成器阻塞 swap）时视频线程在 send
+        // 上被背压阻塞，杜绝帧在无界队列里以每帧数 MB 的速度无限堆积；
+        // 发送后用 app::awake() 手动唤醒事件循环（见 video.rs）。
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Message>(2);
         let (recycle_tx, recycle_rx) = mpsc::channel::<YuvFrame>();
         *recycle_handle.borrow_mut() = Some(recycle_tx);
 
@@ -269,6 +284,7 @@ fn main() -> Result<()> {
                 sample_rate,
                 audio_done.clone(),
                 sync.clone(),
+                paused.clone(),
             );
         }
 
@@ -290,7 +306,7 @@ fn main() -> Result<()> {
         // 收到 End 结束本源，继续下一个源
         let mut finished = false;
         while app.wait() && !finished {
-            while let Some(msg) = rx.recv() {
+            while let Ok(msg) = rx.try_recv() {
                 match msg {
                     Message::Frame(new_frame) => {
                         if let Some(old_frame) = frame_store.borrow_mut().replace(new_frame)

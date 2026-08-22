@@ -18,6 +18,7 @@ pub fn spawn_audio_thread(
     sample_rate: u32,
     audio_done: Arc<AtomicU64>,
     done_cond: Arc<(Mutex<()>, Condvar)>,
+    paused: Arc<(Mutex<bool>, Condvar)>,
 ) {
     std::thread::spawn(move || -> Result<()> {
         let mut decoder = codec::context::Context::from_parameters(audio_parameters)?
@@ -32,6 +33,16 @@ pub fn spawn_audio_thread(
             ffmpeg_next::channel_layout::ChannelLayout::STEREO,
             sample_rate,
         )?;
+
+        // 暂停时在条件变量上挂起，恢复时由键盘处理器 notify_all 唤醒，
+        // 避免暂停期间继续解码预填缓冲或忙等空转
+        let wait_if_paused = |p: &Arc<(Mutex<bool>, Condvar)>| {
+            let (lock, cond) = &**p;
+            let mut guard = lock.lock().unwrap();
+            while *guard {
+                guard = cond.wait(guard).unwrap();
+            }
+        };
 
         // resampler.run 只会为输出帧分配和输入等长的缓冲，
         // 重采样后样本数会变多(如 44.1k->48k)，超出的部分会滞留在重采样器内部。
@@ -51,7 +62,12 @@ pub fn spawn_audio_thread(
                 while offset < samples.len() {
                     let pushed = producer.push_slice(&samples[offset..]);
                     if pushed == 0 {
-                        std::thread::sleep(Duration::from_millis(1));
+                        let is_paused = *paused.0.lock().unwrap();
+                        if is_paused {
+                            wait_if_paused(&paused);
+                        } else {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
                     } else {
                         offset += pushed;
                     }
@@ -59,8 +75,17 @@ pub fn spawn_audio_thread(
             }
         };
 
+        // 复用一个重采样输出帧：容量按需增长，避免每个解码帧都分配释放。
+        // swr_convert_frame 会把 nb_samples 改写为实际写入样本数，
+        // 所以每次调用前要重置回容量值。
+        let f32_packed = ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed);
+        let stereo = ffmpeg_next::channel_layout::ChannelLayout::STEREO;
+        let mut resampled = ffmpeg_next::util::frame::Audio::empty();
+        let mut resampled_cap = 0usize;
+
         let mut eof = false;
         while !eof {
+            wait_if_paused(&paused);
             match audio_rx.recv() {
                 Ok(packet) => {
                     let _ = decoder.send_packet(&packet);
@@ -74,14 +99,11 @@ pub fn spawn_audio_thread(
             while decoder.receive_frame(&mut decoded).is_ok() {
                 let out_cap =
                     (decoded.samples() as f64 * sample_rate as f64 / src_rate).ceil() as usize + 1;
-                let mut resampled = ffmpeg_next::util::frame::Audio::empty();
-                unsafe {
-                    resampled.alloc(
-                        ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
-                        out_cap,
-                        ffmpeg_next::channel_layout::ChannelLayout::STEREO,
-                    );
+                if out_cap > resampled_cap {
+                    unsafe { resampled.alloc(f32_packed, out_cap, stereo) };
+                    resampled_cap = out_cap;
                 }
+                resampled.set_samples(resampled_cap);
                 if resampler.run(&decoded, &mut resampled).is_ok() {
                     push_samples(&resampled, &mut producer);
                 }
@@ -89,16 +111,12 @@ pub fn spawn_audio_thread(
         }
 
         // 冲刷重采样器内部残留的尾部样本
-        //todo 判断 flush 返回的实际样本数，如果小于 8192，可以将其截断（resized）后再推送，或者直接推 8192 但只读取前 N 个样本（取决于 push_samples 的实现是否依赖 samples() 字段）。
         loop {
-            let mut resampled = ffmpeg_next::util::frame::Audio::empty();
-            unsafe {
-                resampled.alloc(
-                    ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
-                    8192,
-                    ffmpeg_next::channel_layout::ChannelLayout::STEREO,
-                );
+            if resampled_cap == 0 {
+                unsafe { resampled.alloc(f32_packed, 8192, stereo) };
+                resampled_cap = 8192;
             }
+            resampled.set_samples(resampled_cap);
             match resampler.flush(&mut resampled) {
                 Ok(_) => {
                     if resampled.samples() == 0 {
