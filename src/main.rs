@@ -70,6 +70,9 @@ fn main() -> Result<()> {
     }
 
     ffmpeg_next::init()?;
+    // 压掉 ffmpeg 的 INFO 日志（如 HLS 每个分片的 "Opening ... for reading"），
+    // 只保留真正的错误输出
+    ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Error);
 
     let app = app::App::default();
     let (screen_w, screen_h) = app::screen_size();
