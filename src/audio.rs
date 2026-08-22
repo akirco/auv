@@ -99,8 +99,13 @@ pub fn spawn_audio_thread(
             while decoder.receive_frame(&mut decoded).is_ok() {
                 let out_cap =
                     (decoded.samples() as f64 * sample_rate as f64 / src_rate).ceil() as usize + 1;
+                // 注意：ffmpeg-next 的 Audio::alloc 对已持有缓冲的帧会静默失败
+                // （av_frame_get_buffer 返回 EINVAL 被忽略），必须丢弃旧帧换新帧，
+                // 否则 nb_samples 与实际缓冲脱节导致越界写（堆损坏）
                 if out_cap > resampled_cap {
-                    unsafe { resampled.alloc(f32_packed, out_cap, stereo) };
+                    let mut grown = ffmpeg_next::util::frame::Audio::empty();
+                    unsafe { grown.alloc(f32_packed, out_cap, stereo) };
+                    resampled = grown;
                     resampled_cap = out_cap;
                 }
                 resampled.set_samples(resampled_cap);
