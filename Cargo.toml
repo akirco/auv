@@ -6,22 +6,19 @@ description = "AUV is a media player written in Rust.(fltk, cpal, ffmpeg-next)"
 
 [dependencies]
 anyhow = "1.0.104"
-cpal = "0.18.1"
-env_logger = "0.11"
+cpal = "0.18.2"
+env_logger = "0.11.11"
 ffmpeg-next = "9.0.0"
 fltk = { version = "1.5.23", features = ["enable-glwindow", "use-wayland"] }
 gl = "0.14.0"
-log = "0.4"
-png = "0.17.16"
-ringbuf = "0.5.1"
+log = "0.4.34"
+png = "0.18.1"
+ringbuf = "0.5.2"
 
 [profile.dev]
-# debug 构建也保持基本优化，避免 cargo run 播视频解码头重脚轻
 opt-level = 1
 
 [profile.release]
-# 不启用 panic=abort：工作线程（音频/视频/demux）panic 时走 unwind，
-# 配合主循环的等待超时兜底降级为"本源播不下去"，而不是整个进程崩溃
 opt-level = 3
 strip = true
 lto = true
