@@ -242,33 +242,36 @@ pub fn draw_frame(w: &GlWindow, state: &RenderState, frame: &YuvFrame) {
                 cur,
                 gl::TEXTURE0,
                 0,
-                frame.y.as_ptr(),
-                frame.y.len() as isize,
-                frame.width,
-                frame.height,
-                frame.y_stride,
+                &frame.y,
+                PlaneDims {
+                    width: frame.width,
+                    height: frame.height,
+                    stride: frame.y_stride,
+                },
             );
             upload_plane(
                 state,
                 cur,
                 gl::TEXTURE1,
                 1,
-                frame.u.as_ptr(),
-                frame.u.len() as isize,
-                frame.width / 2,
-                frame.height / 2,
-                frame.uv_stride,
+                &frame.u,
+                PlaneDims {
+                    width: frame.width / 2,
+                    height: frame.height / 2,
+                    stride: frame.uv_stride,
+                },
             );
             upload_plane(
                 state,
                 cur,
                 gl::TEXTURE2,
                 2,
-                frame.v.as_ptr(),
-                frame.v.len() as isize,
-                frame.width / 2,
-                frame.height / 2,
-                frame.uv_stride,
+                &frame.v,
+                PlaneDims {
+                    width: frame.width / 2,
+                    height: frame.height / 2,
+                    stride: frame.uv_stride,
+                },
             );
             state.pbo_cur.set((cur + 1) % 3);
 
@@ -286,19 +289,24 @@ pub fn draw_frame(w: &GlWindow, state: &RenderState, frame: &YuvFrame) {
 // 从而允许 MAP_UNSYNCHRONIZED 立即映射、跳过驱动的隐式同步（避免偶发阻塞）。
 // 存储只在容量不足（首次或换分辨率）时分配一次；之后每帧 MapBufferRange
 // 映射后自行拷贝并 INVALIDATE，避免 glBufferData 每帧重新分配存储的开销。
-#[allow(clippy::too_many_arguments)]
+
+// 单个平面的尺寸/行距描述（y/uv 平面共用上传签名，避免散参数）
+struct PlaneDims {
+    width: i32,
+    height: i32,
+    stride: i32,
+}
+
 unsafe fn upload_plane(
     state: &RenderState,
     cur: usize,
     unit: u32,
     pbo_idx: usize,
-    data: *const u8,
-    len: isize,
-    width: i32,
-    height: i32,
-    stride: i32,
+    bytes: &[u8],
+    dims: PlaneDims,
 ) {
     unsafe {
+        let len = bytes.len() as isize;
         let slot = pbo_idx * 3 + cur;
         // 等该缓冲上一轮 TexSubImage2D 在 GPU 侧完成（回绕已隔 2 帧，
         // 正常情况已经 signaled，timeout=0 的检查只是一次状态查询）
@@ -338,19 +346,19 @@ unsafe fn upload_plane(
         );
         if ptr.is_null() {
             // 映射失败兜底：退回驱动内拷贝
-            gl::BufferData(gl::PIXEL_UNPACK_BUFFER, len, data as *const _, gl::STREAM_DRAW);
+            gl::BufferData(gl::PIXEL_UNPACK_BUFFER, len, bytes.as_ptr() as *const _, gl::STREAM_DRAW);
         } else {
-            std::ptr::copy_nonoverlapping(data, ptr as *mut u8, len as usize);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
             gl::UnmapBuffer(gl::PIXEL_UNPACK_BUFFER);
         }
-        gl::PixelStorei(gl::UNPACK_ROW_LENGTH, stride);
+        gl::PixelStorei(gl::UNPACK_ROW_LENGTH, dims.stride);
         gl::TexSubImage2D(
             gl::TEXTURE_2D,
             0,
             0,
             0,
-            width,
-            height,
+            dims.width,
+            dims.height,
             gl::RED,
             gl::UNSIGNED_BYTE,
             std::ptr::null(),

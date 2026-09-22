@@ -272,35 +272,35 @@ fn main() -> Result<()> {
         if let (Some(producer), Some(audio_parameters)) = (audio_producer.take(), audio_params)
             && audio_index.is_some()
         {
-            audio::spawn_audio_thread(
+            audio::spawn_audio_thread(audio::AudioThreadCtx {
                 audio_rx,
                 audio_parameters,
                 producer,
                 sample_rate,
                 channels,
-                audio_done.clone(),
-                sync.clone(),
-                paused.clone(),
-                audio_dead.clone(),
-                seek_ctl.clone(),
-                samples_played_arc.clone(),
-                ring_clear.clone(),
-            );
+                audio_done: audio_done.clone(),
+                done_cond: sync.clone(),
+                paused: paused.clone(),
+                audio_dead: audio_dead.clone(),
+                ctl: seek_ctl.clone(),
+                samples_played: samples_played_arc.clone(),
+                ring_clear: ring_clear.clone(),
+            });
         }
 
         // 视频解码与同步线程
-        video::spawn_video_thread(
+        video::spawn_video_thread(video::VideoThreadCtx {
             tx,
             recycle_rx,
-            master_clock,
-            paused.clone(),
-            audio_done.clone(),
-            sync.clone(),
+            clock: master_clock,
+            paused: paused.clone(),
+            audio_done: audio_done.clone(),
+            sync: sync.clone(),
             video_rx,
-            video_params,
+            video_parameters: video_params,
             video_time_base,
-            seek_ctl.clone(),
-        );
+            ctl: seek_ctl.clone(),
+        });
 
         played_any = true;
 
