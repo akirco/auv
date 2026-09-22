@@ -1,7 +1,11 @@
-use std::cell::Cell;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    cell::Cell,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 // Audio Master Clock
 pub struct MasterClock {
@@ -61,13 +65,14 @@ impl MasterClock {
     // 把"当前时刻"对齐到 t：seek 后首个解码帧的 pts 与之对齐，修正解码器
     // 选中关键帧与请求点的偏差（保持已累计的采样/墙钟量，只平移基准）
     pub fn rebase(&self, t: f64) {
-        self.base_sec.set(self.base_sec.get() + t - self.get_time_sec());
+        self.base_sec
+            .set(self.base_sec.get() + t - self.get_time_sec());
     }
 
     // 获取声卡当前播放到的绝对时间（秒）
     pub fn get_time_sec(&self) -> f64 {
-        let audio_ok = self.has_audio && self.sample_rate > 0
-            && self.audio_dead.load(Ordering::Relaxed) == 0;
+        let audio_ok =
+            self.has_audio && self.sample_rate > 0 && self.audio_dead.load(Ordering::Relaxed) == 0;
         if audio_ok {
             let samples = self.samples_played.load(Ordering::Relaxed) as f64;
             self.base_sec.get() + samples / (self.sample_rate as f64 * self.channels as f64)

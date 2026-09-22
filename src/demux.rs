@@ -1,10 +1,7 @@
 use anyhow::Result;
-use ffmpeg_next::codec::packet::Packet;
-use ffmpeg_next::format;
-use ffmpeg_next::{codec, media};
+use ffmpeg_next::{codec, codec::packet::Packet, format, media};
 use log::{info, warn};
-use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc::SyncSender};
 
 // 跨线程 seek 协调（每源一个）。
 // 角色分工：
@@ -191,8 +188,10 @@ pub fn extract_streams(ictx: &format::context::Input) -> Result<StreamInfo> {
             let h = dec.height();
             let sar = dec.aspect_ratio();
             // 变形宽银幕（sar != 1）按像素宽高比修正显示宽度
-            if sar.numerator() > 0 && sar.denominator() > 0 && sar.numerator() != sar.denominator() {
-                let dw = ((w as u64 * sar.numerator() as u64) / sar.denominator() as u64).max(1) as u32;
+            if sar.numerator() > 0 && sar.denominator() > 0 && sar.numerator() != sar.denominator()
+            {
+                let dw =
+                    ((w as u64 * sar.numerator() as u64) / sar.denominator() as u64).max(1) as u32;
                 (dw, h)
             } else {
                 (w, h)

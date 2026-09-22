@@ -1,10 +1,9 @@
-use std::cell::Cell;
-use std::ffi::CString;
+use std::{cell::Cell, ffi::CString};
 
 use fltk::window::GlWindow;
 use log::error;
 
-use crate::frame::{color_matrix, YuvFrame};
+use crate::frame::{YuvFrame, color_matrix};
 
 // 渲染状态：PBO 三缓冲 id（3 个平面 × 3 个缓冲）与已分配容量、纹理尺寸跟踪、
 // 当前使用的缓冲索引、色彩矩阵与 range uniform 位置、每缓冲的异步上传同步对象
@@ -333,7 +332,12 @@ unsafe fn upload_plane(
         gl::ActiveTexture(unit);
         gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, state.pbo[pbo_idx][cur]);
         if len > state.pbo_cap.get()[pbo_idx] {
-            gl::BufferData(gl::PIXEL_UNPACK_BUFFER, len, std::ptr::null(), gl::STREAM_DRAW);
+            gl::BufferData(
+                gl::PIXEL_UNPACK_BUFFER,
+                len,
+                std::ptr::null(),
+                gl::STREAM_DRAW,
+            );
             let mut caps = state.pbo_cap.get();
             caps[pbo_idx] = len;
             state.pbo_cap.set(caps);
@@ -346,7 +350,12 @@ unsafe fn upload_plane(
         );
         if ptr.is_null() {
             // 映射失败兜底：退回驱动内拷贝
-            gl::BufferData(gl::PIXEL_UNPACK_BUFFER, len, bytes.as_ptr() as *const _, gl::STREAM_DRAW);
+            gl::BufferData(
+                gl::PIXEL_UNPACK_BUFFER,
+                len,
+                bytes.as_ptr() as *const _,
+                gl::STREAM_DRAW,
+            );
         } else {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
             gl::UnmapBuffer(gl::PIXEL_UNPACK_BUFFER);

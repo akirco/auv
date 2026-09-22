@@ -1,0 +1,7 @@
+# configuration for https://github.io
+newline_style = "Unix"
+use_field_init_shorthand = true
+style_edition = "2024"
+imports_granularity = "Crate"
+reorder_imports = true
+group_imports = "Preserve"

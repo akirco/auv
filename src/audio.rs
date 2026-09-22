@@ -1,16 +1,21 @@
 use anyhow::Result;
 use cpal::traits::DeviceTrait;
-use ffmpeg_next::codec;
-use ffmpeg_next::codec::packet::Packet;
-use ffmpeg_next::channel_layout::ChannelLayout;
-use ffmpeg_next::software::resampling;
+use ffmpeg_next::{
+    channel_layout::ChannelLayout, codec, codec::packet::Packet, software::resampling,
+};
 use log::warn;
-use ringbuf::HeapProd;
-use ringbuf::traits::{Observer, Producer};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use ringbuf::{
+    HeapProd,
+    traits::{Observer, Producer},
+};
+use std::{
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::Receiver,
+    },
+    time::Duration,
+};
 
 use crate::demux::SeekCtl;
 
@@ -92,7 +97,8 @@ impl AudioThread {
             .decoder()
             .audio()?;
         let src_rate = decoder.rate() as f64;
-        let f32_packed = ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed);
+        let f32_packed =
+            ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed);
 
         // 重采样输出布局必须与设备实际通道数一致，否则环形缓冲每时刻写入与
         // 消费的样本数不匹配，导致播放变速 + 持续下溢补静音。
@@ -158,7 +164,14 @@ impl AudioThread {
         out_layout: ChannelLayout,
         sample_rate: u32,
     ) -> std::result::Result<resampling::Context, ffmpeg_next::Error> {
-        resampling::Context::get(in_format, in_layout, in_rate, f32_packed, out_layout, sample_rate)
+        resampling::Context::get(
+            in_format,
+            in_layout,
+            in_rate,
+            f32_packed,
+            out_layout,
+            sample_rate,
+        )
     }
 
     // 暂停时在条件变量上挂起，恢复时由键盘处理器 notify_all 唤醒，
@@ -174,9 +187,7 @@ impl AudioThread {
             if self.ctl.epoch() != self.local_epoch {
                 return true;
             }
-            let (g, _) = cond
-                .wait_timeout(guard, Duration::from_millis(50))
-                .unwrap();
+            let (g, _) = cond.wait_timeout(guard, Duration::from_millis(50)).unwrap();
             guard = g;
         }
         false
@@ -297,8 +308,7 @@ impl AudioThread {
                     self.resampled_cap = out_cap;
                 }
                 self.resampled.set_samples(self.resampled_cap);
-                if self.resampler.run(&decoded, &mut self.resampled).is_ok()
-                    && !self.push_samples()
+                if self.resampler.run(&decoded, &mut self.resampled).is_ok() && !self.push_samples()
                 {
                     dead = true;
                     break;

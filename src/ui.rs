@@ -1,18 +1,22 @@
 // UI 侧模块：直接操作窗口/GL 的代码与跨源共享的播放器状态。
 // 主程序只负责装配与源循环，窗口回调（绘制/按键）与纯展示换算都归这里。
 use cpal::traits::StreamTrait;
-use fltk::app;
-use fltk::prelude::*;
-use fltk::window::GlWindow;
+use fltk::{app, prelude::*, window::GlWindow};
 use log::{error, info};
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+};
 
-use crate::frame::YuvFrame;
-use crate::render::{self, draw_frame};
+use crate::{
+    frame::YuvFrame,
+    render::{self, draw_frame},
+};
 
 // 跨源共享的播放器状态：绘制/按键回调与 UI 循环共用的句柄。
 // 生命周期长于单个源，源切换时各字段按需更新；成组持有避免散落的
@@ -158,21 +162,17 @@ pub fn register_window_callbacks(
                 || key == fltk::enums::Key::from_char('=')
             {
                 // 音量 +10%（上限 200%）
-                let _ = volume_keys.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |v| Some((v + 10).min(200)),
-                );
+                let _ = volume_keys.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some((v + 10).min(200))
+                });
                 info!("Volume: {}%", volume_keys.load(Ordering::Relaxed));
             } else if key == fltk::enums::Key::from_char('-')
                 || key == fltk::enums::Key::from_char('_')
             {
                 // 音量 -10%（下限 0%）
-                let _ = volume_keys.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |v| Some(v.saturating_sub(10)),
-                );
+                let _ = volume_keys.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(10))
+                });
                 info!("Volume: {}%", volume_keys.load(Ordering::Relaxed));
             } else if key == fltk::enums::Key::from_char('m')
                 || key == fltk::enums::Key::from_char('M')

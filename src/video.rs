@@ -1,18 +1,26 @@
 use anyhow::Result;
-use ffmpeg_next::codec;
-use ffmpeg_next::codec::packet::Packet;
-use ffmpeg_next::format::Pixel;
-use ffmpeg_next::software::scaling::{context::Context as ScaleContext, flag::Flags as ScaleFlags};
+use ffmpeg_next::{
+    codec,
+    codec::packet::Packet,
+    format::Pixel,
+    software::scaling::{context::Context as ScaleContext, flag::Flags as ScaleFlags},
+};
 use fltk::app;
 use log::{error, warn};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{Receiver, SyncSender},
+    },
+    time::{Duration, Instant},
+};
 
-use crate::clock::MasterClock;
-use crate::demux::SeekCtl;
-use crate::frame::{Message, YuvFrame};
+use crate::{
+    clock::MasterClock,
+    demux::SeekCtl,
+    frame::{Message, YuvFrame},
+};
 
 // 视频解码线程：从 demux 通道收 packet 解码，按主时钟同步节奏发送给 UI。
 // UI 侧用有界通道接收：UI 停顿时 send 阻塞产生背压，防止帧无限堆积；
@@ -80,9 +88,11 @@ impl VideoThread {
             ctl,
         } = ctx;
         let decoder = match video_parameters {
-            Some(params) => {
-                Some(codec::context::Context::from_parameters(params)?.decoder().video()?)
-            }
+            Some(params) => Some(
+                codec::context::Context::from_parameters(params)?
+                    .decoder()
+                    .video()?,
+            ),
             None => None,
         };
         Ok(Self {
@@ -139,7 +149,13 @@ impl VideoThread {
                 }
             }
             let mut decoded = ffmpeg_next::util::frame::video::Video::empty();
-            while self.decoder.as_mut().unwrap().receive_frame(&mut decoded).is_ok() {
+            while self
+                .decoder
+                .as_mut()
+                .unwrap()
+                .receive_frame(&mut decoded)
+                .is_ok()
+            {
                 self.process_frame(&decoded);
             }
         }
@@ -279,12 +295,10 @@ impl VideoThread {
         // 渲染视口与窗口宽高比都按修正后的尺寸计算
         let (disp_w, disp_h) = {
             let sar = decoded.aspect_ratio();
-            if sar.numerator() > 0
-                && sar.denominator() > 0
-                && sar.numerator() != sar.denominator()
+            if sar.numerator() > 0 && sar.denominator() > 0 && sar.numerator() != sar.denominator()
             {
-                let dw = (w as i64 * sar.numerator() as i64 / sar.denominator() as i64)
-                    .max(1) as i32;
+                let dw =
+                    (w as i64 * sar.numerator() as i64 / sar.denominator() as i64).max(1) as i32;
                 (dw, src.height() as i32)
             } else {
                 (w as i32, src.height() as i32)

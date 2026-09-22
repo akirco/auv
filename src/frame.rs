@@ -18,7 +18,7 @@ pub struct YuvFrame {
     pub height: i32,
     pub y_stride: i32,
     pub uv_stride: i32,
-    pub pts_sec: f64, // 视频帧的时间戳（秒）
+    pub pts_sec: f64,   // 视频帧的时间戳（秒）
     pub frame_gen: u64, // 帧代号（跨源唯一递增）
     // 流的色彩信息（帧级 side data）：渲染/截图据此选择转换矩阵与范围
     pub color_space: Space,

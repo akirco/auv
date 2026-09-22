@@ -13,17 +13,18 @@ use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fltk::{app, prelude::*, window::GlWindow};
 use log::{error, warn};
-use ringbuf::HeapRb;
-use ringbuf::traits::*;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use ringbuf::{HeapRb, traits::*};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicU64, Ordering},
+    mpsc,
+};
 
-use cli::{parse_cli, CliAction, USAGE};
+use cli::{CliAction, USAGE, parse_cli};
 use clock::MasterClock;
-use demux::{extract_streams, StreamInfo};
+use demux::{StreamInfo, extract_streams};
 use frame::{Message, YuvFrame};
-use ui::{calc_display_size, format_time, PlayerState};
+use ui::{PlayerState, calc_display_size, format_time};
 
 fn main() -> Result<()> {
     // 日志分级（RUST_LOG 控制）：默认 info；worker 线程与主循环共用同一 logger
@@ -34,7 +35,10 @@ fn main() -> Result<()> {
         let thread = std::thread::current();
         let name = thread.name().unwrap_or("<unnamed>");
         eprintln!("[auv panic] thread '{name}': {info}");
-        if std::env::var("RUST_BACKTRACE").map(|v| v != "0").unwrap_or(false) {
+        if std::env::var("RUST_BACKTRACE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
             let bt = std::backtrace::Backtrace::capture();
             eprintln!("backtrace:\n{bt}");
         } else {
@@ -254,7 +258,14 @@ fn main() -> Result<()> {
         let (audio_tx, audio_rx) = mpsc::sync_channel::<ffmpeg_next::codec::packet::Packet>(200);
 
         // 解复用线程：统一读取媒体 packet 并分发
-        demux::spawn_demux_thread(ictx, video_index, audio_index, video_tx, audio_tx, seek_ctl.clone());
+        demux::spawn_demux_thread(
+            ictx,
+            video_index,
+            audio_index,
+            video_tx,
+            audio_tx,
+            seek_ctl.clone(),
+        );
 
         // 音频是否已全部播完（含环形缓冲排空）。视频线程据此决定何时结束播放，
         // 避免视频先播完就把还没播出的音频尾部截断。
