@@ -1,4 +1,5 @@
 use anyhow::Result;
+use cpal::traits::DeviceTrait;
 use ffmpeg_next::codec;
 use ffmpeg_next::codec::packet::Packet;
 use ffmpeg_next::channel_layout::ChannelLayout;
@@ -272,4 +273,40 @@ pub fn spawn_audio_thread(
         }
         Ok(())
     });
+}
+
+// 挑选音频输出配置：放大 ALSA period（cpal 内部再按 2× 双缓冲），
+// 给实时 worker 线程更多容错余量，降低偶发下溢（xrun/EIO）触发率。
+// 采样格式取 F32（与环缓冲样本类型一致）、采样率/声道沿用设备默认；
+// 优先指到 2048 帧（≈43ms@48kHz）的 period，超出设备支持范围时退而取上限。
+// 解析失败时回退设备默认配置。
+pub fn prepare_audio_config(device: &cpal::Device) -> Option<cpal::StreamConfig> {
+    let default = device.default_output_config().ok()?;
+    let rate = default.sample_rate();
+    let ch = default.channels();
+    // 找"F32 + 默认声道 + 覆盖默认采样率"的声明范围；找不到就用默认配置
+    let ranges: Vec<_> = device.supported_output_configs().ok()?.collect();
+    let sc = ranges
+        .iter()
+        .find(|r| {
+            r.sample_format() == cpal::SampleFormat::F32
+                && r.channels() == ch
+                && r.min_sample_rate() <= rate
+                && rate <= r.max_sample_rate()
+        })
+        .map(|r| r.with_sample_rate(rate))
+        .unwrap_or(default);
+    let mut cfg = sc.config();
+    // 放大 period：优先 2048 帧，不超过设备支持的周期上限（各有 lower/higher bound）
+    if let cpal::SupportedBufferSize::Range { min, max } = sc.buffer_size() {
+        let want = 2048u32.clamp(*min, *max);
+        if want != 2048 {
+            warn!(
+                "Audio: device period range {}-{} frames, using {}",
+                min, max, want
+            );
+        }
+        cfg.buffer_size = cpal::BufferSize::Fixed(want);
+    }
+    Some(cfg)
 }

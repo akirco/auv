@@ -1,5 +1,7 @@
+use anyhow::Result;
 use ffmpeg_next::codec::packet::Packet;
 use ffmpeg_next::format;
+use ffmpeg_next::{codec, media};
 use log::{info, warn};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
@@ -161,6 +163,52 @@ pub fn spawn_demux_thread(
         // 循环结束（EOF/错误）后 sender 随线程退出而 drop，
         // 解码线程的 recv 返回 Err，触发各自的 flush 收尾。
     });
+}
+
+// 单个媒体源的流信息（各解码线程初始化用；struct 化避免字段错位）
+pub struct StreamInfo {
+    pub video_index: Option<usize>,
+    pub audio_index: Option<usize>,
+    pub video_params: Option<codec::parameters::Parameters>,
+    pub audio_params: Option<codec::parameters::Parameters>,
+    pub video_time_base: Option<ffmpeg_next::Rational>,
+    pub disp_w: u32, // SAR 修正后的显示宽度
+    pub disp_h: u32,
+}
+
+// 从已打开的 demux 上下文提取视频/音频流信息，供各解码线程使用
+pub fn extract_streams(ictx: &format::context::Input) -> Result<StreamInfo> {
+    let video_stream = ictx.streams().best(media::Type::Video);
+    let audio_stream = ictx.streams().best(media::Type::Audio);
+    let video_params = video_stream.as_ref().map(|s| s.parameters().clone());
+    let audio_params = audio_stream.as_ref().map(|s| s.parameters().clone());
+    let (disp_w, disp_h) = match video_params.as_ref() {
+        Some(p) => {
+            let dec = codec::context::Context::from_parameters(p.clone())?
+                .decoder()
+                .video()?;
+            let w = dec.width();
+            let h = dec.height();
+            let sar = dec.aspect_ratio();
+            // 变形宽银幕（sar != 1）按像素宽高比修正显示宽度
+            if sar.numerator() > 0 && sar.denominator() > 0 && sar.numerator() != sar.denominator() {
+                let dw = ((w as u64 * sar.numerator() as u64) / sar.denominator() as u64).max(1) as u32;
+                (dw, h)
+            } else {
+                (w, h)
+            }
+        }
+        None => return Err(anyhow::anyhow!("No video stream found")),
+    };
+    Ok(StreamInfo {
+        video_index: video_stream.as_ref().map(|s| s.index()),
+        audio_index: audio_stream.as_ref().map(|s| s.index()),
+        video_params,
+        audio_params,
+        video_time_base: video_stream.as_ref().map(|s| s.time_base()),
+        disp_w,
+        disp_h,
+    })
 }
 
 #[cfg(test)]

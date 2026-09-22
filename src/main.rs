@@ -1,150 +1,29 @@
 mod audio;
+mod cli;
 mod clock;
 mod demux;
 mod frame;
 mod render;
+mod screenshot;
+mod ui;
 mod util;
 mod video;
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ffmpeg_next::{codec, media};
 use fltk::{app, prelude::*, window::GlWindow};
-use log::{error, info, warn};
+use log::{error, warn};
 use ringbuf::HeapRb;
 use ringbuf::traits::*;
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 
+use cli::{parse_cli, CliAction, USAGE};
 use clock::MasterClock;
+use demux::{extract_streams, StreamInfo};
 use frame::{Message, YuvFrame};
-use render::draw_frame;
-use util::{calc_display_size, hyprctl_toggle_fullscreen, is_hyprland};
-
-// 命令行用法说明（--help / 无参数时打印）
-const USAGE: &str = "\
-Usage: auv [options] <file_or_url>...
-  -h, --help               show this help and exit
-  -V, --version            print version and exit
-  -p, --playlist <file>    load sources from a playlist file (one per line, '#' comments)
-  --                       treat all following arguments as file names (e.g. files starting with '-')
-
-Page links (bilibili, youtube, ...) require yt-dlp installed;
-yt-dlp options like --cookies go into ~/.config/yt-dlp/config";
-
-// 跨源共享的播放器状态：绘制/按键回调与 UI 循环共用的句柄。
-// 生命周期长于单个源，源切换时各字段按需更新；成组持有避免散落的
-// Rc<RefCell>/Arc 相互传递出错位。
-struct PlayerState {
-    stream_handle: Rc<RefCell<Option<cpal::Stream>>>,
-    recycle_handle: Rc<RefCell<Option<mpsc::Sender<YuvFrame>>>>,
-    frame_store: Rc<RefCell<Option<YuvFrame>>>,
-    seek_handle: Rc<RefCell<Option<Arc<demux::SeekCtl>>>>,
-    dur_handle: Rc<RefCell<f64>>,
-    paused: Arc<(Mutex<bool>, Condvar)>,
-    volume: Arc<AtomicU64>,
-    mute: Arc<AtomicU64>,
-}
-
-impl PlayerState {
-    fn new() -> Self {
-        Self {
-            stream_handle: Rc::new(RefCell::new(None)),
-            recycle_handle: Rc::new(RefCell::new(None)),
-            frame_store: Rc::new(RefCell::new(None)),
-            seek_handle: Rc::new(RefCell::new(None)),
-            dur_handle: Rc::new(RefCell::new(0.0)),
-            paused: Arc::new((Mutex::new(false), Condvar::new())),
-            volume: Arc::new(AtomicU64::new(100)),
-            mute: Arc::new(AtomicU64::new(0)),
-        }
-    }
-}
-
-// 单个媒体源的流信息（各解码线程初始化用；struct 化避免字段错位）
-struct StreamInfo {
-    video_index: Option<usize>,
-    audio_index: Option<usize>,
-    video_params: Option<codec::parameters::Parameters>,
-    audio_params: Option<codec::parameters::Parameters>,
-    video_time_base: Option<ffmpeg_next::Rational>,
-    disp_w: u32, // SAR 修正后的显示宽度
-    disp_h: u32,
-}
-
-// 从已打开的 demux 上下文提取视频/音频流信息，供各解码线程使用
-fn extract_streams(ictx: &ffmpeg_next::format::context::Input) -> Result<StreamInfo> {
-    let video_stream = ictx.streams().best(media::Type::Video);
-    let audio_stream = ictx.streams().best(media::Type::Audio);
-    let video_params = video_stream.as_ref().map(|s| s.parameters().clone());
-    let audio_params = audio_stream.as_ref().map(|s| s.parameters().clone());
-    let (disp_w, disp_h) = match video_params.as_ref() {
-        Some(p) => {
-            let dec = codec::context::Context::from_parameters(p.clone())?
-                .decoder()
-                .video()?;
-            let w = dec.width();
-            let h = dec.height();
-            let sar = dec.aspect_ratio();
-            // 变形宽银幕（sar != 1）按像素宽高比修正显示宽度
-            if sar.numerator() > 0 && sar.denominator() > 0 && sar.numerator() != sar.denominator() {
-                let dw = ((w as u64 * sar.numerator() as u64) / sar.denominator() as u64).max(1) as u32;
-                (dw, h)
-            } else {
-                (w, h)
-            }
-        }
-        None => return Err(anyhow::anyhow!("No video stream found")),
-    };
-    Ok(StreamInfo {
-        video_index: video_stream.as_ref().map(|s| s.index()),
-        audio_index: audio_stream.as_ref().map(|s| s.index()),
-        video_params,
-        audio_params,
-        video_time_base: video_stream.as_ref().map(|s| s.time_base()),
-        disp_w,
-        disp_h,
-    })
-}
-
-// 挑选音频输出配置：放大 ALSA period（cpal 内部再按 2× 双缓冲），
-// 给实时 worker 线程更多容错余量，降低偶发下溢（xrun/EIO）触发率。
-// 采样格式取 F32（与环缓冲样本类型一致）、采样率/声道沿用设备默认；
-// 优先指到 2048 帧（≈43ms@48kHz）的 period，超出设备支持范围时退而取上限。
-// 解析失败时回退设备默认配置。
-fn prepare_audio_config(device: &cpal::Device) -> Option<cpal::StreamConfig> {
-    let default = device.default_output_config().ok()?;
-    let rate = default.sample_rate();
-    let ch = default.channels();
-    // 找"F32 + 默认声道 + 覆盖默认采样率"的声明范围；找不到就用默认配置
-    let ranges: Vec<_> = device.supported_output_configs().ok()?.collect();
-    let sc = ranges
-        .iter()
-        .find(|r| {
-            r.sample_format() == cpal::SampleFormat::F32
-                && r.channels() == ch
-                && r.min_sample_rate() <= rate
-                && rate <= r.max_sample_rate()
-        })
-        .map(|r| r.with_sample_rate(rate))
-        .unwrap_or(default);
-    let mut cfg = sc.config();
-    // 放大 period：优先 2048 帧，不超过设备支持的周期上限（各有 lower/higher bound）
-    if let cpal::SupportedBufferSize::Range { min, max } = sc.buffer_size() {
-        let want = 2048u32.clamp(*min, *max);
-        if want != 2048 {
-            warn!(
-                "Audio: device period range {}-{} frames, using {}",
-                min, max, want
-            );
-        }
-        cfg.buffer_size = cpal::BufferSize::Fixed(want);
-    }
-    Some(cfg)
-}
+use ui::{calc_display_size, format_time, PlayerState};
 
 fn main() -> Result<()> {
     // 日志分级（RUST_LOG 控制）：默认 info；worker 线程与主循环共用同一 logger
@@ -164,13 +43,13 @@ fn main() -> Result<()> {
     }));
 
     let args: Vec<String> = std::env::args().collect();
-    let sources = match util::parse_cli(&args[1..])? {
-        util::CliAction::Play(sources) => sources,
-        util::CliAction::Help => {
+    let sources = match parse_cli(&args[1..])? {
+        CliAction::Play(sources) => sources,
+        CliAction::Help => {
             println!("{}", USAGE);
             return Ok(());
         }
-        util::CliAction::Version => {
+        CliAction::Version => {
             println!("auv {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
@@ -204,7 +83,7 @@ fn main() -> Result<()> {
     let host = cpal::default_host();
     let audio_device = host.default_output_device();
     let (sample_rate, channels, stream_config) =
-        match audio_device.as_ref().and_then(prepare_audio_config) {
+        match audio_device.as_ref().and_then(audio::prepare_audio_config) {
             Some(cfg) => (cfg.sample_rate, cfg.channels as u32, Some(cfg)),
             None => (0, 0, None),
         };
@@ -250,135 +129,8 @@ fn main() -> Result<()> {
             win.set_label(title_base.as_str());
             win.show();
 
-            win.make_current();
-            // 呈现节奏锁定显示器刷新率，避免无谓的满速 present 抢占 GPU
-            win.set_swap_interval(1);
-            gl::load_with(|s| win.get_proc_address(s) as *const _);
-            let rs = unsafe { render::setup_opengl() };
-
-            let draw_store = state.frame_store.clone();
-            win.draw(move |w| {
-                let frame_guard = draw_store.borrow();
-                if let Some(frame) = frame_guard.as_ref() {
-                    draw_frame(w, &rs, frame);
-                }
-            });
-
-            let app_close = app;
-            let paused_keys = paused.clone();
-            let stream_handle_keys = state.stream_handle.clone();
-            let frame_store_keys = state.frame_store.clone();
-            let seek_keys = state.seek_handle.clone();
-            let dur_keys = state.dur_handle.clone();
-            let volume_keys = volume.clone();
-            let mute_keys = mute.clone();
-            win.handle(move |w, ev| {
-                if ev == fltk::enums::Event::Close {
-                    app_close.quit();
-                    return true;
-                }
-                if ev == fltk::enums::Event::KeyDown {
-                    let key = app::event_key();
-                    if key == fltk::enums::Key::from_char(' ') {
-                        // 在锁内翻转暂停状态并通知视频线程，避免通知丢失导致其永久睡眠
-                        let mut guard = paused_keys.0.lock().unwrap();
-                        *guard = !*guard;
-                        let paused_now = *guard;
-                        if let Some(s) = stream_handle_keys.borrow().as_ref() {
-                            if paused_now {
-                                let _ = s.pause();
-                            } else {
-                                let _ = s.play();
-                            }
-                        }
-                        paused_keys.1.notify_all();
-                    } else if key == fltk::enums::Key::from_char('f')
-                        || key == fltk::enums::Key::from_char('F')
-                    {
-                        if is_hyprland() {
-                            hyprctl_toggle_fullscreen();
-                        } else {
-                            w.fullscreen(!w.fullscreen_active());
-                        }
-                    } else if key == fltk::enums::Key::from_char('s')
-                        || key == fltk::enums::Key::from_char('S')
-                    {
-                        // 把当前显示的帧存为 PNG 截图（保存到当前工作目录）
-                        if let Some(frame) = frame_store_keys.borrow().as_ref() {
-                            match util::save_screenshot(frame) {
-                                Ok(p) => info!("Screenshot saved: {}", p.display()),
-                                Err(e) => error!("Screenshot failed: {}", e),
-                            }
-                        }
-                    } else if key == fltk::enums::Key::Left
-                        || key == fltk::enums::Key::Right
-                        || key == fltk::enums::Key::from_char('[')
-                        || key == fltk::enums::Key::from_char(']')
-                        || key == fltk::enums::Key::Home
-                    {
-                        // 相对/绝对 seek：←/→ 退进 10s，[ / ] 退进 5s，Home 回到开头。
-                        // 当前位置取当前显示帧的 pts；总时长未知时只保证不为负
-                        let ctl = seek_keys.borrow().clone();
-                        if let Some(ctl) = ctl {
-                            let cur = frame_store_keys
-                                .borrow()
-                                .as_ref()
-                                .map_or(0.0, |f| f.pts_sec);
-                            let delta = if key == fltk::enums::Key::Left {
-                                -10.0
-                            } else if key == fltk::enums::Key::Right {
-                                10.0
-                            } else if key == fltk::enums::Key::from_char('[') {
-                                -5.0
-                            } else if key == fltk::enums::Key::from_char(']') {
-                                5.0
-                            } else {
-                                f64::NEG_INFINITY // Home：跳到开头
-                            };
-                            let mut target = if delta == f64::NEG_INFINITY {
-                                0.0
-                            } else {
-                                cur + delta
-                            };
-                            let dur = *dur_keys.borrow();
-                            target = if dur > 0.0 {
-                                target.clamp(0.0, dur)
-                            } else {
-                                target.max(0.0)
-                            };
-                            ctl.request(target);
-                            // 唤醒暂停中阻塞在条件变量上的解码线程，让它们立即处理 seek
-                            paused_keys.1.notify_all();
-                        }
-                    } else if key == fltk::enums::Key::from_char('+')
-                        || key == fltk::enums::Key::from_char('=')
-                    {
-                        // 音量 +10%（上限 200%）
-                        let _ = volume_keys.fetch_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |v| Some((v + 10).min(200)),
-                        );
-                        info!("Volume: {}%", volume_keys.load(Ordering::Relaxed));
-                    } else if key == fltk::enums::Key::from_char('-')
-                        || key == fltk::enums::Key::from_char('_')
-                    {
-                        // 音量 -10%（下限 0%）
-                        let _ = volume_keys.fetch_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |v| Some(v.saturating_sub(10)),
-                        );
-                        info!("Volume: {}%", volume_keys.load(Ordering::Relaxed));
-                    } else if key == fltk::enums::Key::from_char('m')
-                        || key == fltk::enums::Key::from_char('M')
-                    {
-                        let was = mute_keys.fetch_xor(1, Ordering::Relaxed);
-                        info!("Mute: {}", if was == 0 { "ON" } else { "OFF" });
-                    }
-                }
-                false
-            });
+            let rs = ui::setup_gl(&mut win);
+            ui::register_window_callbacks(&mut win, &app, &state, rs);
             gl_ready = true;
         } else {
             // 后续源：调整窗口尺寸与标题，复用 GL 上下文
@@ -570,11 +322,11 @@ fn main() -> Result<()> {
                                 format!(
                                     "{} [{}/{}]",
                                     title_base,
-                                    util::format_time(cur_sec),
-                                    util::format_time(dur)
+                                    format_time(cur_sec),
+                                    format_time(dur)
                                 )
                             } else {
-                                format!("{} [{}]", title_base, util::format_time(cur_sec))
+                                format!("{} [{}]", title_base, format_time(cur_sec))
                             };
                             win.set_label(&label);
                         }
