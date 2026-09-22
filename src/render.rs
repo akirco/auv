@@ -3,20 +3,25 @@ use std::ffi::CString;
 
 use fltk::window::GlWindow;
 
-use crate::frame::YuvFrame;
+use crate::frame::{color_matrix, YuvFrame};
 
-// 渲染状态：PBO 双缓冲 id（3 个平面 × 2 个缓冲）与已分配容量、纹理尺寸跟踪、
-// 当前使用的缓冲索引、色彩矩阵 uniform 位置
+// 渲染状态：PBO 三缓冲 id（3 个平面 × 3 个缓冲）与已分配容量、纹理尺寸跟踪、
+// 当前使用的缓冲索引、色彩矩阵与 range uniform 位置、每缓冲的异步上传同步对象
 pub struct RenderState {
-    pbo: [[u32; 2]; 3],
+    pbo: [[u32; 3]; 3],
     pbo_cap: Cell<[isize; 3]>,
     tex_size: Cell<(i32, i32)>,
     pbo_cur: Cell<usize>,
     cmat_loc: i32,
+    range_y_loc: i32,
+    range_uv_loc: i32,
     last_gen: Cell<u64>, // 已上传的帧代号，窗口 damage 重绘时跳过重复上传
+    // 每平面 × 每缓冲一个 fence：记录"该缓冲上次 TexSubImage2D 的 GPU 完成信号"，
+    // 回绕复用时先等待，从而允许 MAP_UNSYNCHRONIZED 立即映射而无需驱动隐式同步
+    fences: [Cell<gl::types::GLsync>; 9],
 }
 
-// 初始化 GL 上下文：编译着色器、创建 VAO/纹理/PBO 双缓冲。
+// 初始化 GL 上下文：编译着色器、创建 VAO/纹理/PBO 三缓冲。
 // program、纹理绑定、VAO 都是进程生命周期内不变的状态，只设置一次，
 // draw 时只切换采样单元并更新纹理数据。
 pub unsafe fn setup_opengl() -> RenderState {
@@ -45,6 +50,13 @@ pub unsafe fn setup_opengl() -> RenderState {
         gl::UseProgram(shader_program);
         let cmat_loc =
             gl::GetUniformLocation(shader_program, CString::new("cmat").unwrap().as_ptr());
+        let range_y_loc =
+            gl::GetUniformLocation(shader_program, CString::new("rangeY").unwrap().as_ptr());
+        let range_uv_loc =
+            gl::GetUniformLocation(shader_program, CString::new("rangeUV").unwrap().as_ptr());
+        // 初始默认 full range，避免首帧前出现全黑/灰屏
+        gl::Uniform2f(range_y_loc, 0.0, 1.0);
+        gl::Uniform2f(range_uv_loc, 0.5, 1.0);
         gl::Uniform1i(
             gl::GetUniformLocation(shader_program, CString::new("texY").unwrap().as_ptr()),
             0,
@@ -124,10 +136,11 @@ pub unsafe fn setup_opengl() -> RenderState {
         gl::ActiveTexture(gl::TEXTURE2);
         gl::BindTexture(gl::TEXTURE_2D, textures[2]);
 
-        // PBO 双缓冲：3 个平面各 2 个缓冲，交替写入，隐藏 GPU 异步上传的等待。
+        // PBO 三缓冲：3 个平面各 3 个缓冲，轮转写入，隐藏 GPU 异步上传的等待。
+        // 相比双缓冲，回绕间隔更长（2 帧 → 3 帧），几乎总能命中已完成的缓冲。
         // 存储在首次使用（或换分辨率）时才按需分配。
-        let mut pbo = [[0; 2]; 3];
-        gl::GenBuffers(6, pbo.as_mut_ptr() as *mut u32);
+        let mut pbo = [[0; 3]; 3];
+        gl::GenBuffers(9, pbo.as_mut_ptr() as *mut u32);
 
         RenderState {
             pbo,
@@ -135,14 +148,17 @@ pub unsafe fn setup_opengl() -> RenderState {
             tex_size: Cell::new((-1, -1)),
             pbo_cur: Cell::new(0),
             cmat_loc,
+            range_y_loc,
+            range_uv_loc,
             last_gen: Cell::new(u64::MAX),
+            fences: std::array::from_fn(|_| Cell::new(std::ptr::null())),
         }
     }
 }
 
-// 绘制一帧：按视频宽高比居中留黑边。
+// 绘制一帧：按视频显示宽高比（含 SAR 修正）居中留黑边。
 // 纹理存储只在尺寸变化时重新分配；此后每帧把数据写进 PBO（CPU 快速拷贝），
-// 再 TexSubImage2D 让 GPU 异步 DMA 到纹理，双缓冲避免 CPU 阻塞等待上传。
+// 再 TexSubImage2D 让 GPU 异步 DMA 到纹理，三缓冲 + fence 避免 CPU 阻塞等待上传。
 pub fn draw_frame(w: &GlWindow, state: &RenderState, frame: &YuvFrame) {
     unsafe {
         gl::Clear(gl::COLOR_BUFFER_BIT);
@@ -150,8 +166,8 @@ pub fn draw_frame(w: &GlWindow, state: &RenderState, frame: &YuvFrame) {
         // HiDPI/Wayland 下 GL 视口以物理像素计，用 pixel_* 而非逻辑尺寸
         let win_w = w.pixel_w() as f32;
         let win_h = w.pixel_h() as f32;
-        let vw = frame.width as f32;
-        let vh = frame.height as f32;
+        let vw = frame.disp_w as f32;
+        let vh = frame.disp_h as f32;
         let (vp_w, vp_h) = if vw / vh > win_w / win_h {
             (win_w, win_w * vh / vw)
         } else {
@@ -161,13 +177,12 @@ pub fn draw_frame(w: &GlWindow, state: &RenderState, frame: &YuvFrame) {
         let vp_y = ((win_h - vp_h) / 2.0) as i32;
         gl::Viewport(vp_x, vp_y, vp_w as i32, vp_h as i32);
 
-        // 色彩矩阵按分辨率选择：HD 及以上用 BT.709，否则 BT.601
-        let (rv, gu, gv, bu) = if frame.height >= 720 {
-            (1.5748, -0.1873, -0.4681, 1.8556)
-        } else {
-            (1.402, -0.344136, -0.714136, 1.772)
-        };
-        gl::Uniform4f(state.cmat_loc, rv, gu, gv, bu);
+        // 按流的色彩空间/范围选择转换参数（含 full/limited range 归一），
+        // 不再按分辨率猜测；未标注时保持 HD+ → BT.709 的回退
+        let cm = color_matrix(frame.color_space, frame.color_range, frame.height);
+        gl::Uniform4f(state.cmat_loc, cm.rv, cm.gu, cm.gv, cm.bu);
+        gl::Uniform2f(state.range_y_loc, cm.y_off, cm.y_gain);
+        gl::Uniform2f(state.range_uv_loc, cm.uv_center, cm.uv_gain);
 
         // 只有新帧才重新分配纹理与上传数据；FLTK 在鼠标移动等无关事件
         // 触发窗口 damage 重绘时会再次调用本回调，重复整帧上传纯属浪费
@@ -254,7 +269,7 @@ pub fn draw_frame(w: &GlWindow, state: &RenderState, frame: &YuvFrame) {
                 frame.height / 2,
                 frame.uv_stride,
             );
-            state.pbo_cur.set(1 - cur);
+            state.pbo_cur.set((cur + 1) % 3);
 
             gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
         }
@@ -265,7 +280,9 @@ pub fn draw_frame(w: &GlWindow, state: &RenderState, frame: &YuvFrame) {
 }
 
 // 把一帧单个平面的数据写入 PBO 并触发异步上传。
-// 双缓冲：本帧写缓冲 A 时，上一帧 GPU 正在从缓冲 B 读取，互不等待。
+// 三缓冲：本帧写缓冲 N 时，GPU 正在从之前的缓冲读取，互不等待。
+// 回绕复用同一缓冲前，先 ClientWaitSync 等上一轮的异步上传完成，
+// 从而允许 MAP_UNSYNCHRONIZED 立即映射、跳过驱动的隐式同步（避免偶发阻塞）。
 // 存储只在容量不足（首次或换分辨率）时分配一次；之后每帧 MapBufferRange
 // 映射后自行拷贝并 INVALIDATE，避免 glBufferData 每帧重新分配存储的开销。
 #[allow(clippy::too_many_arguments)]
@@ -281,6 +298,29 @@ unsafe fn upload_plane(
     stride: i32,
 ) {
     unsafe {
+        let slot = pbo_idx * 3 + cur;
+        // 等该缓冲上一轮 TexSubImage2D 在 GPU 侧完成（回绕已隔 2 帧，
+        // 正常情况已经 signaled，timeout=0 的检查只是一次状态查询）
+        let prev = state.fences[slot].get();
+        if !prev.is_null() {
+            // 正常情况已 signaled，timeout=0 只是一次状态查询
+            let mut status = gl::ClientWaitSync(prev, gl::SYNC_FLUSH_COMMANDS_BIT, 0);
+            if status == gl::TIMEOUT_EXPIRED {
+                // 极少见：GPU 积压超深，分块等待直到完成（每次 16ms，最多 8 次）
+                for _ in 0..8 {
+                    status = gl::ClientWaitSync(prev, gl::SYNC_FLUSH_COMMANDS_BIT, 16_000_000);
+                    if status != gl::TIMEOUT_EXPIRED {
+                        break;
+                    }
+                }
+            }
+            if status == gl::TIMEOUT_EXPIRED {
+                // 依然忙：跳过本帧上传（纹理保持上一帧内容），
+                // 避免 MAP_UNSYNCHRONIZED 写入仍在被 DMA 读取的内存
+                return;
+            }
+        }
+
         gl::ActiveTexture(unit);
         gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, state.pbo[pbo_idx][cur]);
         if len > state.pbo_cap.get()[pbo_idx] {
@@ -293,7 +333,7 @@ unsafe fn upload_plane(
             gl::PIXEL_UNPACK_BUFFER,
             0,
             len,
-            gl::MAP_WRITE_BIT | gl::MAP_INVALIDATE_BUFFER_BIT,
+            gl::MAP_WRITE_BIT | gl::MAP_INVALIDATE_BUFFER_BIT | gl::MAP_UNSYNCHRONIZED_BIT,
         );
         if ptr.is_null() {
             // 映射失败兜底：退回驱动内拷贝
@@ -314,6 +354,15 @@ unsafe fn upload_plane(
             gl::UNSIGNED_BYTE,
             std::ptr::null(),
         );
+
+        // 为本缓冲记录本轮上传的完成信号，替换已等待完的旧 fence
+        let done = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if !done.is_null() {
+            if !prev.is_null() {
+                gl::DeleteSync(prev);
+            }
+            state.fences[slot].set(done);
+        }
     }
 }
 

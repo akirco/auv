@@ -10,7 +10,12 @@ cpal = "0.18.1"
 ffmpeg-next = "9.0.0"
 fltk = { version = "1.5.23", features = ["enable-glwindow", "use-wayland"] }
 gl = "0.14.0"
+png = "0.17.16"
 ringbuf = "0.5.1"
+
+[profile.dev]
+# debug 构建也保持基本优化，避免 cargo run 播视频解码头重脚轻
+opt-level = 1
 
 [profile.release]
 opt-level = 3
