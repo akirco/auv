@@ -3,6 +3,7 @@ use ffmpeg_next::codec;
 use ffmpeg_next::codec::packet::Packet;
 use ffmpeg_next::channel_layout::ChannelLayout;
 use ffmpeg_next::software::resampling;
+use log::warn;
 use ringbuf::HeapProd;
 use ringbuf::traits::{Observer, Producer};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,7 +51,7 @@ pub fn spawn_audio_thread(
             _ => ChannelLayout::STEREO,
         };
         if out_layout.channels() != channels as i32 {
-            eprintln!(
+            warn!(
                 "Audio: device has {} channels, no direct layout, falling back to stereo",
                 channels
             );

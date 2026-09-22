@@ -1,5 +1,6 @@
 use ffmpeg_next::codec::packet::Packet;
 use ffmpeg_next::format;
+use log::{info, warn};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -150,9 +151,9 @@ pub fn spawn_demux_thread(
                 let hi = ts.saturating_add(250_000);
                 let ok = ictx.seek(ts, lo..hi).is_ok();
                 if ok {
-                    eprintln!("Seek to {:.2}s", target_sec);
+                    info!("Seek to {:.2}s", target_sec);
                 } else {
-                    eprintln!("Seek to {:.2}s failed", target_sec);
+                    warn!("Seek to {:.2}s failed", target_sec);
                 }
             }
             // 继续 'source：重建 packet 迭代器（读位置已更新）

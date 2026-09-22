@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::ffi::CString;
 
 use fltk::window::GlWindow;
+use log::error;
 
 use crate::frame::{color_matrix, YuvFrame};
 
@@ -372,7 +373,7 @@ unsafe fn log_shader_status(shader: u32, label: &str) {
         let mut ok = 0;
         gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut ok);
         if ok != gl::TRUE as i32 {
-            eprintln!(
+            error!(
                 "GL {} shader compile failed: {}",
                 label,
                 info_log(|len, written, buf| gl::GetShaderInfoLog(shader, len, written, buf))
@@ -386,7 +387,7 @@ unsafe fn log_program_status(program: u32) {
         let mut ok = 0;
         gl::GetProgramiv(program, gl::LINK_STATUS, &mut ok);
         if ok != gl::TRUE as i32 {
-            eprintln!(
+            error!(
                 "GL program link failed: {}",
                 info_log(|len, written, buf| gl::GetProgramInfoLog(program, len, written, buf))
             );

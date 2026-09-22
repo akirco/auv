@@ -4,6 +4,7 @@ use ffmpeg_next::codec::packet::Packet;
 use ffmpeg_next::format::Pixel;
 use ffmpeg_next::software::scaling::{context::Context as ScaleContext, flag::Flags as ScaleFlags};
 use fltk::app;
+use log::{error, warn};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -139,7 +140,7 @@ pub fn spawn_video_thread(
                         ) {
                             Ok(ctx) => scaler = Some((ctx, key)),
                             Err(e) => {
-                                eprintln!("swscale init failed ({:?}): {}", key.0, e);
+                                error!("swscale init failed ({:?}): {}", key.0, e);
                                 return;
                             }
                         }
@@ -258,12 +259,21 @@ pub fn spawn_video_thread(
         // 等待期间仍响应 seek：demux 若重新发包，排空即可（解码循环已结束）
         let (done_lock, done_cond) = &*sync;
         let mut done_guard = done_lock.lock().unwrap();
+        // 兜底超时：若音频线程 panic 退出，audio_done 永远不置位，
+        // 超过时限就放弃等待、按普通收尾继续，避免本源永久挂起
+        let mut deadline = Instant::now() + Duration::from_secs(5);
         while audio_done.load(Ordering::Relaxed) == 0 {
             if let Some((e, _t)) = ctl.snapshot_new(local_epoch.get()) {
                 local_epoch.set(e);
                 while video_rx.try_recv().is_ok() {}
                 ctl.report_ready(e);
+                // seek 后音频可能从头再播，重置超时避免误判其死亡
+                deadline = Instant::now() + Duration::from_secs(5);
                 continue;
+            }
+            if Instant::now() >= deadline {
+                warn!("audio thread did not finish within 5s (may have panicked); ending source");
+                break;
             }
             done_guard = done_cond
                 .wait_timeout(done_guard, Duration::from_millis(50))

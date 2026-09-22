@@ -82,7 +82,13 @@ https://example.com/live.m3u8
 完整命令格式：
 
 ```text
-auv <file_or_url>... [-p|--playlist <list.txt>]
+auv [options] <file_or_url>...
+  -h, --help               显示帮助并退出
+  -V, --version            打印版本并退出
+  -p, --playlist <file>    从播放列表读取源（每行一个，忽略空行与 # 注释）
+  --                       之后的参数一律视为文件（允许文件名以 - 开头）
+
+日志分级：设置环境变量 RUST_LOG=error|warn|info|debug 控制输出（默认 info）。
 ```
 
 ## 播放控制

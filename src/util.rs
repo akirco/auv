@@ -52,28 +52,50 @@ pub fn reap_child(child: &mut Option<Child>) {
     }
 }
 
-// 解析命令行媒体源：普通参数直接进列表；"-p/--playlist <file>" 读取文件，
-// 每行一个条目（忽略空行与 # 开头），可混放本地文件与网络流。
-pub fn parse_sources(args: &[String]) -> Result<Vec<String>> {
+// CLI 解析结果：播放给定源，或要求打印帮助/版本
+pub enum CliAction {
+    Play(Vec<String>),
+    Help,
+    Version,
+}
+
+// 解析命令行参数：
+// - `-h/--help`、`-V/--version` 触发帮助/版本（出现即生效）；
+// - `--` 之后的所有参数一律视为媒体源（允许文件名以 `-` 开头，如 `-p`）；
+// - `-p/--playlist <file>` 读取播放列表，每行一个条目（忽略空行与 # 开头），
+//   可混放本地文件与网络流。
+pub fn parse_cli(args: &[String]) -> Result<CliAction> {
     let mut sources = Vec::new();
     let mut it = args.iter();
+    let mut literal = false; // `--` 之后不再解析选项
     while let Some(arg) = it.next() {
-        if arg == "-p" || arg == "--playlist" {
-            let path = it
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("{} requires a file path", arg))?;
-            let content = std::fs::read_to_string(path)?;
-            for line in content.lines() {
-                let line = line.trim();
-                if !line.is_empty() && !line.starts_with('#') {
-                    sources.push(line.to_string());
+        if !literal {
+            match arg.as_str() {
+                "-h" | "--help" => return Ok(CliAction::Help),
+                "-V" | "--version" => return Ok(CliAction::Version),
+                "--" => {
+                    literal = true;
+                    continue;
                 }
+                "-p" | "--playlist" => {
+                    let path = it
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("{} requires a file path", arg))?;
+                    let content = std::fs::read_to_string(path)?;
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if !line.is_empty() && !line.starts_with('#') {
+                            sources.push(line.to_string());
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
             }
-        } else {
-            sources.push(arg.clone());
         }
+        sources.push(arg.clone());
     }
-    Ok(sources)
+    Ok(CliAction::Play(sources))
 }
 
 // 把当前 YUV420P 帧转为 RGB 并保存为 PNG 截图（保存到当前工作目录）。

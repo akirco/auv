@@ -10,6 +10,7 @@ use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ffmpeg_next::{codec, media};
 use fltk::{app, prelude::*, window::GlWindow};
+use log::{error, info, warn};
 use ringbuf::HeapRb;
 use ringbuf::traits::*;
 use std::cell::RefCell;
@@ -22,6 +23,92 @@ use clock::MasterClock;
 use frame::{Message, YuvFrame};
 use render::draw_frame;
 use util::{calc_display_size, hyprctl_toggle_fullscreen, is_hyprland};
+
+// 命令行用法说明（--help / 无参数时打印）
+const USAGE: &str = "\
+Usage: auv [options] <file_or_url>...
+  -h, --help               show this help and exit
+  -V, --version            print version and exit
+  -p, --playlist <file>    load sources from a playlist file (one per line, '#' comments)
+  --                       treat all following arguments as file names (e.g. files starting with '-')
+
+Page links (bilibili, youtube, ...) require yt-dlp installed;
+yt-dlp options like --cookies go into ~/.config/yt-dlp/config";
+
+// 跨源共享的播放器状态：绘制/按键回调与 UI 循环共用的句柄。
+// 生命周期长于单个源，源切换时各字段按需更新；成组持有避免散落的
+// Rc<RefCell>/Arc 相互传递出错位。
+struct PlayerState {
+    stream_handle: Rc<RefCell<Option<cpal::Stream>>>,
+    recycle_handle: Rc<RefCell<Option<mpsc::Sender<YuvFrame>>>>,
+    frame_store: Rc<RefCell<Option<YuvFrame>>>,
+    seek_handle: Rc<RefCell<Option<Arc<demux::SeekCtl>>>>,
+    dur_handle: Rc<RefCell<f64>>,
+    paused: Arc<(Mutex<bool>, Condvar)>,
+    volume: Arc<AtomicU64>,
+    mute: Arc<AtomicU64>,
+}
+
+impl PlayerState {
+    fn new() -> Self {
+        Self {
+            stream_handle: Rc::new(RefCell::new(None)),
+            recycle_handle: Rc::new(RefCell::new(None)),
+            frame_store: Rc::new(RefCell::new(None)),
+            seek_handle: Rc::new(RefCell::new(None)),
+            dur_handle: Rc::new(RefCell::new(0.0)),
+            paused: Arc::new((Mutex::new(false), Condvar::new())),
+            volume: Arc::new(AtomicU64::new(100)),
+            mute: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+// 单个媒体源的流信息（各解码线程初始化用；struct 化避免字段错位）
+struct StreamInfo {
+    video_index: Option<usize>,
+    audio_index: Option<usize>,
+    video_params: Option<codec::parameters::Parameters>,
+    audio_params: Option<codec::parameters::Parameters>,
+    video_time_base: Option<ffmpeg_next::Rational>,
+    disp_w: u32, // SAR 修正后的显示宽度
+    disp_h: u32,
+}
+
+// 从已打开的 demux 上下文提取视频/音频流信息，供各解码线程使用
+fn extract_streams(ictx: &ffmpeg_next::format::context::Input) -> Result<StreamInfo> {
+    let video_stream = ictx.streams().best(media::Type::Video);
+    let audio_stream = ictx.streams().best(media::Type::Audio);
+    let video_params = video_stream.as_ref().map(|s| s.parameters().clone());
+    let audio_params = audio_stream.as_ref().map(|s| s.parameters().clone());
+    let (disp_w, disp_h) = match video_params.as_ref() {
+        Some(p) => {
+            let dec = codec::context::Context::from_parameters(p.clone())?
+                .decoder()
+                .video()?;
+            let w = dec.width();
+            let h = dec.height();
+            let sar = dec.aspect_ratio();
+            // 变形宽银幕（sar != 1）按像素宽高比修正显示宽度
+            if sar.numerator() > 0 && sar.denominator() > 0 && sar.numerator() != sar.denominator() {
+                let dw = ((w as u64 * sar.numerator() as u64) / sar.denominator() as u64).max(1) as u32;
+                (dw, h)
+            } else {
+                (w, h)
+            }
+        }
+        None => return Err(anyhow::anyhow!("No video stream found")),
+    };
+    Ok(StreamInfo {
+        video_index: video_stream.as_ref().map(|s| s.index()),
+        audio_index: audio_stream.as_ref().map(|s| s.index()),
+        video_params,
+        audio_params,
+        video_time_base: video_stream.as_ref().map(|s| s.time_base()),
+        disp_w,
+        disp_h,
+    })
+}
 
 // 挑选音频输出配置：放大 ALSA period（cpal 内部再按 2× 双缓冲），
 // 给实时 worker 线程更多容错余量，降低偶发下溢（xrun/EIO）触发率。
@@ -49,7 +136,7 @@ fn prepare_audio_config(device: &cpal::Device) -> Option<cpal::StreamConfig> {
     if let cpal::SupportedBufferSize::Range { min, max } = sc.buffer_size() {
         let want = 2048u32.clamp(*min, *max);
         if want != 2048 {
-            eprintln!(
+            warn!(
                 "Audio: device period range {}-{} frames, using {}",
                 min, max, want
             );
@@ -59,59 +146,38 @@ fn prepare_audio_config(device: &cpal::Device) -> Option<cpal::StreamConfig> {
     Some(cfg)
 }
 
-// 单个媒体源的流信息
-type StreamInfo = (
-    Option<usize>,                         // video_index
-    Option<usize>,                         // audio_index
-    Option<codec::parameters::Parameters>, // video_params
-    Option<codec::parameters::Parameters>, // audio_params
-    Option<ffmpeg_next::Rational>,         // video_time_base
-    u32,                                   // video_disp_w（SAR 修正后的显示宽度）
-    u32,                                   // video_disp_h
-);
-
-// 从已打开的 demux 上下文提取视频/音频流信息，供各解码线程使用
-fn extract_streams(ictx: &ffmpeg_next::format::context::Input) -> Result<StreamInfo> {
-    let video_stream = ictx.streams().best(media::Type::Video);
-    let audio_stream = ictx.streams().best(media::Type::Audio);
-    let video_params = video_stream.as_ref().map(|s| s.parameters().clone());
-    let audio_params = audio_stream.as_ref().map(|s| s.parameters().clone());
-    let (disp_w, disp_h) = match video_params.as_ref() {
-        Some(p) => {
-            let dec = codec::context::Context::from_parameters(p.clone())?
-                .decoder()
-                .video()?;
-            let w = dec.width();
-            let h = dec.height();
-            let sar = dec.aspect_ratio();
-            // 变形宽银幕（sar != 1）按像素宽高比修正显示宽度
-            if sar.numerator() > 0 && sar.denominator() > 0 && sar.numerator() != sar.denominator() {
-                let dw = ((w as u64 * sar.numerator() as u64) / sar.denominator() as u64).max(1) as u32;
-                (dw, h)
-            } else {
-                (w, h)
-            }
-        }
-        None => return Err(anyhow::anyhow!("No video stream found")),
-    };
-    Ok((
-        video_stream.as_ref().map(|s| s.index()),
-        audio_stream.as_ref().map(|s| s.index()),
-        video_params,
-        audio_params,
-        video_stream.as_ref().map(|s| s.time_base()),
-        disp_w,
-        disp_h,
-    ))
-}
-
 fn main() -> Result<()> {
+    // 日志分级（RUST_LOG 控制）：默认 info；worker 线程与主循环共用同一 logger
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // 统一的 panic 钩子：线程 panic 不再让进程裸崩溃（已去 panic=abort），
+    // 打印现场与 backtrace 提示，便于定位工作线程问题
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        eprintln!("[auv panic] thread '{name}': {info}");
+        if std::env::var("RUST_BACKTRACE").map(|v| v != "0").unwrap_or(false) {
+            let bt = std::backtrace::Backtrace::capture();
+            eprintln!("backtrace:\n{bt}");
+        } else {
+            eprintln!("(set RUST_BACKTRACE=1 for a backtrace)");
+        }
+    }));
+
     let args: Vec<String> = std::env::args().collect();
-    let sources = util::parse_sources(&args[1..])?;
+    let sources = match util::parse_cli(&args[1..])? {
+        util::CliAction::Play(sources) => sources,
+        util::CliAction::Help => {
+            println!("{}", USAGE);
+            return Ok(());
+        }
+        util::CliAction::Version => {
+            println!("auv {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+    };
     if sources.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Usage: auv <file_or_url>... [-p|--playlist <list.txt>]\nPage links (bilibili, youtube, ...) require yt-dlp installed;\nytdlp options like --cookies/--cookies-from-browser go into ~/.config/yt-dlp/config"
-        ));
+        eprintln!("{}", USAGE);
+        return Err(anyhow::anyhow!("no media source given"));
     }
 
     ffmpeg_next::init()?;
@@ -127,18 +193,12 @@ fn main() -> Result<()> {
     win.set_mode(fltk::enums::Mode::Opengl3);
     win.end();
 
-    // 跨源共享的句柄：当前音频流（按键处理器用）、回收通道发送端（UI 用）、帧缓存
-    let stream_handle = Rc::new(RefCell::new(None::<cpal::Stream>));
-    let recycle_handle = Rc::new(RefCell::new(None::<mpsc::Sender<YuvFrame>>));
-    let frame_store = Rc::new(RefCell::new(None::<YuvFrame>));
-    let paused = Arc::new((Mutex::new(false), Condvar::new()));
-    // seek 协调器句柄（每源一个，按键处理器经句柄取当前源）
-    let seek_handle = Rc::new(RefCell::new(None::<Arc<demux::SeekCtl>>));
-    // 当前源总时长（秒）；按键处理器据此把 seek 目标钳制到 [0, 时长]
-    let dur_handle = Rc::new(RefCell::new(0.0f64));
-    // 音量百分比（0..=200）与静音开关（0/1）：跨源保持，在 cpal 回调里应用
-    let volume = Arc::new(AtomicU64::new(100));
-    let mute = Arc::new(AtomicU64::new(0));
+    // 播放器状态：跨源共享的句柄集中管理（绘制/按键回调与 UI 循环共用）
+    let state = PlayerState::new();
+    let paused = state.paused.clone();
+    let dur_handle = state.dur_handle.clone();
+    let volume = state.volume.clone();
+    let mute = state.mute.clone();
 
     // 音频输出设备配置只探测一次，跨源不变
     let host = cpal::default_host();
@@ -159,11 +219,11 @@ fn main() -> Result<()> {
         let (ictx, mut ytdlp_child) = match util::open_input(source) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("Skipping {}: {}", source, e);
+                warn!("Skipping {}: {}", source, e);
                 continue;
             }
         };
-        let (
+        let StreamInfo {
             video_index,
             audio_index,
             video_params,
@@ -171,10 +231,10 @@ fn main() -> Result<()> {
             video_time_base,
             disp_w,
             disp_h,
-        ) = match extract_streams(&ictx) {
+        } = match extract_streams(&ictx) {
             Ok(info) => info,
             Err(e) => {
-                eprintln!("Skipping {}: {}", source, e);
+                warn!("Skipping {}: {}", source, e);
                 continue;
             }
         };
@@ -196,7 +256,7 @@ fn main() -> Result<()> {
             gl::load_with(|s| win.get_proc_address(s) as *const _);
             let rs = unsafe { render::setup_opengl() };
 
-            let draw_store = frame_store.clone();
+            let draw_store = state.frame_store.clone();
             win.draw(move |w| {
                 let frame_guard = draw_store.borrow();
                 if let Some(frame) = frame_guard.as_ref() {
@@ -206,10 +266,10 @@ fn main() -> Result<()> {
 
             let app_close = app;
             let paused_keys = paused.clone();
-            let stream_handle_keys = stream_handle.clone();
-            let frame_store_keys = frame_store.clone();
-            let seek_keys = seek_handle.clone();
-            let dur_keys = dur_handle.clone();
+            let stream_handle_keys = state.stream_handle.clone();
+            let frame_store_keys = state.frame_store.clone();
+            let seek_keys = state.seek_handle.clone();
+            let dur_keys = state.dur_handle.clone();
             let volume_keys = volume.clone();
             let mute_keys = mute.clone();
             win.handle(move |w, ev| {
@@ -246,8 +306,8 @@ fn main() -> Result<()> {
                         // 把当前显示的帧存为 PNG 截图（保存到当前工作目录）
                         if let Some(frame) = frame_store_keys.borrow().as_ref() {
                             match util::save_screenshot(frame) {
-                                Ok(p) => eprintln!("Screenshot saved: {}", p.display()),
-                                Err(e) => eprintln!("Screenshot failed: {}", e),
+                                Ok(p) => info!("Screenshot saved: {}", p.display()),
+                                Err(e) => error!("Screenshot failed: {}", e),
                             }
                         }
                     } else if key == fltk::enums::Key::Left
@@ -299,7 +359,7 @@ fn main() -> Result<()> {
                             Ordering::Relaxed,
                             |v| Some((v + 10).min(200)),
                         );
-                        eprintln!("Volume: {}%", volume_keys.load(Ordering::Relaxed));
+                        info!("Volume: {}%", volume_keys.load(Ordering::Relaxed));
                     } else if key == fltk::enums::Key::from_char('-')
                         || key == fltk::enums::Key::from_char('_')
                     {
@@ -309,12 +369,12 @@ fn main() -> Result<()> {
                             Ordering::Relaxed,
                             |v| Some(v.saturating_sub(10)),
                         );
-                        eprintln!("Volume: {}%", volume_keys.load(Ordering::Relaxed));
+                        info!("Volume: {}%", volume_keys.load(Ordering::Relaxed));
                     } else if key == fltk::enums::Key::from_char('m')
                         || key == fltk::enums::Key::from_char('M')
                     {
                         let was = mute_keys.fetch_xor(1, Ordering::Relaxed);
-                        eprintln!("Mute: {}", if was == 0 { "ON" } else { "OFF" });
+                        info!("Mute: {}", if was == 0 { "ON" } else { "OFF" });
                     }
                 }
                 false
@@ -385,7 +445,7 @@ fn main() -> Result<()> {
                         // 设备出错（拔掉、驱动故障等）后置失效标记并只提示一次。
                         // 主时钟随后回退系统时钟，音频线程中止，播放不卡死
                         if audio_dead_cb.swap(1, Ordering::Relaxed) == 0 {
-                            eprintln!("Audio Stream Error: {}", err);
+                            error!("Audio Stream Error: {}", err);
                         }
                     },
                     None,
@@ -396,29 +456,29 @@ fn main() -> Result<()> {
                     Ok(s) => match s.play() {
                         Ok(()) => (Some(s), Some(producer)),
                         Err(e) => {
-                            eprintln!("Audio output failed to start: {}", e);
+                            error!("Audio output failed to start: {}", e);
                             (None, None)
                         }
                     },
                     Err(e) => {
-                        eprintln!("Audio output init failed: {}", e);
+                        error!("Audio output init failed: {}", e);
                         (None, None)
                     }
                 }
             } else {
                 (None, None)
             };
-        *stream_handle.borrow_mut() = audio_stream_opt;
+        *state.stream_handle.borrow_mut() = audio_stream_opt;
 
         // 本源的 seek 协调器：就绪屏障需要视频线程（恒为 1）与音频线程（按需 +1）。
         // 必须在本源线程启动前建好，各线程共享同一份
         let has_audio_thread =
             audio_producer.is_some() && audio_index.is_some() && audio_params.is_some();
         let seek_ctl = Arc::new(demux::SeekCtl::new(1 + usize::from(has_audio_thread)));
-        *seek_handle.borrow_mut() = Some(seek_ctl.clone());
+        *state.seek_handle.borrow_mut() = Some(seek_ctl.clone());
         // 记录总时长（微秒 → 秒）供进度显示与 seek 钳制；未知（0/负）按 0 处理
         let dur_us = ictx.duration();
-        *dur_handle.borrow_mut() = if dur_us > 0 {
+        *state.dur_handle.borrow_mut() = if dur_us > 0 {
             dur_us as f64 / 1_000_000.0
         } else {
             0.0
@@ -434,7 +494,7 @@ fn main() -> Result<()> {
         // 发送后用 app::awake() 手动唤醒事件循环（见 video.rs）。
         let (tx, rx) = std::sync::mpsc::sync_channel::<Message>(2);
         let (recycle_tx, recycle_rx) = mpsc::channel::<YuvFrame>();
-        *recycle_handle.borrow_mut() = Some(recycle_tx);
+        *state.recycle_handle.borrow_mut() = Some(recycle_tx);
 
         // 有界通道：demux 线程分发包给两个解码线程；容量即预缓冲深度，
         // 消费跟不上时 demux 阻塞，自动把网络下载节流到播放速度。
@@ -518,8 +578,8 @@ fn main() -> Result<()> {
                             };
                             win.set_label(&label);
                         }
-                        if let Some(old_frame) = frame_store.borrow_mut().replace(new_frame)
-                            && let Some(tx) = recycle_handle.borrow().as_ref()
+                        if let Some(old_frame) = state.frame_store.borrow_mut().replace(new_frame)
+                            && let Some(tx) = state.recycle_handle.borrow().as_ref()
                         {
                             let _ = tx.send(old_frame);
                         }
@@ -527,9 +587,9 @@ fn main() -> Result<()> {
                     }
                     Message::End => {
                         // 丢弃本源残留帧与通道，避免旧数据串到下一源
-                        frame_store.borrow_mut().take();
-                        *recycle_handle.borrow_mut() = None;
-                        *stream_handle.borrow_mut() = None;
+                        state.frame_store.borrow_mut().take();
+                        *state.recycle_handle.borrow_mut() = None;
+                        *state.stream_handle.borrow_mut() = None;
                         finished = true;
                         break;
                     }
