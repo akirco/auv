@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "AUV is a media player written in Rust.(fltk, cpal, ffmpeg-next)"
 
+[features]
+# 默认用 cpal 原生 PipeWire 后端（Linux 上 cpal::default_host 会优先选它）：
+# 直接和 PipeWire 通信，不受 PipeWire-ALSA 插件「固定 2×period」小缓冲的限制，
+# 也没有其「未锁采样率就上报周期范围」导致的假范围问题。
+# 没有 libpipewire-0.3 开发包的系统可 `--no-default-features` 回退到 ALSA 后端。
+default = ["pipewire"]
+pipewire = ["cpal/pipewire"]
+
 [dependencies]
 anyhow = "1.0.104"
 cpal = "0.18.2"

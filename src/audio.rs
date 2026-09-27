@@ -1,12 +1,12 @@
 use anyhow::Result;
-use cpal::traits::DeviceTrait;
+use cpal::traits::{DeviceTrait, StreamTrait};
 use ffmpeg_next::{
     channel_layout::ChannelLayout, codec, codec::packet::Packet, software::resampling,
 };
-use log::warn;
+use log::{error, warn};
 use ringbuf::{
-    HeapProd,
-    traits::{Observer, Producer},
+    HeapProd, HeapRb,
+    traits::{Consumer, Observer, Producer, Split},
 };
 use std::{
     sync::{
@@ -367,11 +367,15 @@ impl AudioThread {
     }
 }
 
-// 挑选音频输出配置：放大 ALSA period（cpal 内部再按 2× 双缓冲），
-// 给实时 worker 线程更多容错余量，降低偶发下溢（xrun/EIO）触发率。
-// 采样格式取 F32（与环缓冲样本类型一致）、采样率/声道沿用设备默认；
-// 优先指到 2048 帧（≈43ms@48kHz）的 period，超出设备支持范围时退而取上限。
-// 解析失败时回退设备默认配置。
+// 挑选音频输出配置：把缓冲粒度放大到 2048 帧（≈43ms@48kHz），
+// 给实时 worker 更多容错余量，降低下溢（xrun）触发率。
+// 采样格式取 F32（与环缓冲样本类型一致）、采样率/声道沿用设备默认。
+// `BufferSize::Fixed` 的含义随后端而变：
+//   - 原生 PipeWire 后端：解释为节点 quantum/latency（node.latency=<n>/<rate>），
+//     由 PipeWire 负责整体缓冲，不存在「固定 2×period」的小缓冲问题；
+//   - ALSA 后端（--no-default-features）：是 period，cpal 再按 2× 双缓冲分配，
+//     且其上报的周期范围未必可靠（见 build_output_stream），建流失败由调用方回退。
+// 超出声明范围时退而取边界；解析失败时回退设备默认配置。
 pub fn prepare_audio_config(device: &cpal::Device) -> Option<cpal::StreamConfig> {
     let default = device.default_output_config().ok()?;
     let rate = default.sample_rate();
@@ -401,4 +405,81 @@ pub fn prepare_audio_config(device: &cpal::Device) -> Option<cpal::StreamConfig>
         cfg.buffer_size = cpal::BufferSize::Fixed(want);
     }
     Some(cfg)
+}
+
+// 构建音频输出流并启动播放，返回流句柄与环形缓冲 producer（容量 2 秒）。
+// 回调里弹出样本、按共享音量/静音缩放、不足补静音，并把实际交付样本数计入主时钟。
+// 固定缓冲粒度不被设备接受时返回 Err，由调用方退回设备默认配置重试。
+// （ALSA 后端经 PipeWire-ALSA 插件时：枚举阶段未锁采样率，上报范围 85..=91628833；
+//  建流设定 48kHz 后 period 被固定为 1024，导致 Fixed(2048) 被拒，即由此兜底。）
+#[allow(clippy::too_many_arguments)]
+pub fn build_output_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    samples_played: &Arc<AtomicU64>,
+    audio_dead: &Arc<AtomicU64>,
+    volume: &Arc<AtomicU64>,
+    mute: &Arc<AtomicU64>,
+    ring_clear: &Arc<Mutex<bool>>,
+) -> Result<(cpal::Stream, HeapProd<f32>)> {
+    // 容量为 2 秒的无锁环形缓冲区
+    let ring_buf = HeapRb::<f32>::new((config.sample_rate * config.channels as u32 * 2) as usize);
+    let (producer, mut consumer) = ring_buf.split();
+    let samples_played_cb = samples_played.clone();
+    let audio_dead_cb = audio_dead.clone();
+    let volume_cb = volume.clone();
+    let mute_cb = mute.clone();
+    let ring_clear_cb = ring_clear.clone();
+    let stream = device.build_output_stream(
+        *config,
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            // seek 后清空旧音频：置位由音频线程发起，这里实际清空
+            if *ring_clear_cb.lock().unwrap() {
+                consumer.clear();
+                *ring_clear_cb.lock().unwrap() = false;
+            }
+            // 批量弹出音频样本，比逐样本 pop 开销更小
+            let filled = consumer.pop_slice(data);
+            // 音量/静音：按共享百分比缩放（静音系数 0）。
+            // 系数为 1 时跳过循环，常见路径零开销
+            let gain = if mute_cb.load(Ordering::Relaxed) != 0 {
+                0.0
+            } else {
+                (volume_cb.load(Ordering::Relaxed) as f32 / 100.0).clamp(0.0, 2.0)
+            };
+            if gain != 1.0 {
+                for sample in &mut data[..filled] {
+                    *sample *= gain;
+                }
+            }
+            for sample in &mut data[filled..] {
+                *sample = 0.0; // 缓冲区空时输出静音，防止爆音
+            }
+            // 只把实际交付的样本计入主时钟：起播缓冲期时钟不空转，
+            // 视频从 pts≈0 起同步；中途下溢时时钟暂停，视频等待
+            // 而非丢帧，保持音画对齐（无声卡时退回系统时钟）
+            samples_played_cb.fetch_add(filled as u64, Ordering::Relaxed);
+        },
+        move |err| {
+            // 可恢复/非致命错误只告警，不置失效标记，否则启动阶段一次欠载
+            // （xrun，cpal 会自行 prepare() 恢复）或默认设备切换就会永久静音
+            match err.kind() {
+                cpal::ErrorKind::Xrun
+                | cpal::ErrorKind::DeviceChanged
+                | cpal::ErrorKind::RealtimeDenied => {
+                    warn!("Audio Stream (recoverable, {:?}): {}", err.kind(), err);
+                    return;
+                }
+                _ => {}
+            }
+            // 其余错误（拔掉、驱动故障等）视为致命：置失效标记并只提示一次。
+            // 主时钟随后回退系统时钟，音频线程中止，播放不卡死
+            if audio_dead_cb.swap(1, Ordering::Relaxed) == 0 {
+                error!("Audio Stream Error: {}", err);
+            }
+        },
+        None,
+    )?;
+    stream.play()?;
+    Ok((stream, producer))
 }
