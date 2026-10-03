@@ -1,7 +1,11 @@
 use anyhow::Result;
 use ffmpeg_next::{codec, codec::packet::Packet, format, media};
 use log::{info, warn};
-use std::sync::{Arc, Condvar, Mutex, mpsc::SyncSender};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicU64, Ordering},
+    mpsc::SyncSender,
+};
 
 // 跨线程 seek 协调（每源一个）。
 // 角色分工：
@@ -15,6 +19,13 @@ use std::sync::{Arc, Condvar, Mutex, mpsc::SyncSender};
 pub struct SeekCtl {
     // (目标, 代数) 在同一把锁下更新，保证两者读数一致
     state: Mutex<SeekState>,
+    // state.epoch 的原子镜像：热路径只关心"有没有新 seek"——demux 每读一个包
+    // 调一次 snapshot_new、视频同步的 250µs 逼近循环每轮调一次 epoch()，
+    // 原来每次都要抢 state 的 Mutex。改读原子后无 seek 时完全无锁。
+    // 镜像在 state 锁内发布（见 request），因此它与 state.epoch 始终一致，
+    // 读到的值就是权威值；snapshot_new 命中镜像后仍取锁复核，读者随后发生的
+    // 新 seek 只会让它看到更新的代数与配对目标。
+    epoch_hint: AtomicU64,
     // 就绪屏障：(已回报就绪的代数, 该代下已回报的线程数)
     ready: Mutex<(u64, usize)>,
     ready_cond: Condvar,
@@ -23,7 +34,7 @@ pub struct SeekCtl {
 
 struct SeekState {
     target: Option<f64>, // 待处理的 seek 目标（秒）
-    epoch: u64,          // 单调递增的 seek 代数
+    epoch: u64,          // 单调递增的 seek 代数（权威值，镜像是它的副本）
 }
 
 impl SeekCtl {
@@ -34,27 +45,39 @@ impl SeekCtl {
                 target: None,
                 epoch: 0,
             }),
+            epoch_hint: AtomicU64::new(0),
             ready: Mutex::new((0, 0)),
             ready_cond: Condvar::new(),
             ready_max,
         }
     }
 
-    /// 主线程请求 seek 到 target_sec（秒）。同一时刻只保留最新目标
+    /// 主线程请求 seek 到 target_sec（秒）。同一时刻只保留最新目标。
+    /// 目标、代数与原子镜像在同一临界区内一起更新：读者要么三者都看不到
+    /// （无新 seek），要么看到已配好的新代数与新目标，不会读到中间态。
     pub fn request(&self, target_sec: f64) {
         let mut g = self.state.lock().unwrap();
         g.target = Some(target_sec);
         g.epoch += 1;
+        // 必须在锁内发布：否则 state 会短暂领先镜像，解码线程从锁内读到的
+        // 代数将与 epoch() 不一致，原子快路径此后每轮都判为"有变化"而白跑一次锁
+        self.epoch_hint.store(g.epoch, Ordering::Release);
     }
 
-    /// 当前 seek 代数（只读）。解码线程在暂停等待里用它检测是否有新 seek
+    /// 当前 seek 代数（只读，无锁）。解码线程在暂停等待与同步逼近循环里
+    /// 用它检测是否有新 seek；返回值与 state.epoch 一致，无需再取锁
     pub fn epoch(&self) -> u64 {
-        self.state.lock().unwrap().epoch
+        self.epoch_hint.load(Ordering::Acquire)
     }
 
     /// 轮询：local_epoch 为本线程已处理的代数；有新代数时返回 (新代数, 目标)。
+    /// 快路径先读原子镜像（无 seek 时不加锁），有变化时取锁复核，
     /// 目标与代数在同一锁内读取，保证配对一致
     pub fn snapshot_new(&self, local_epoch: u64) -> Option<(u64, Option<f64>)> {
+        // 快路径：镜像与本地代数一致即无新 seek，不加锁
+        if self.epoch() == local_epoch {
+            return None;
+        }
         let g = self.state.lock().unwrap();
         if g.epoch != local_epoch {
             Some((g.epoch, g.target))
@@ -99,6 +122,9 @@ impl SeekCtl {
 // 通道有容量上限，消费跟不上时 send 会阻塞，自动把下载/解包节流到播放速度。
 // seek 时协调三个线程：解码线程先完成本地复位，demux 才移动读位置，保证
 // seek 后的新 packet 不会与旧 packet 混入解码管线（时序由就绪屏障保证）。
+//
+// 返回 JoinHandle：demux 内的 seek/迭代错误是就地 warn 处理、不上抛的，
+// 但 panic（如 unwrap 失配）仍可能发生，调用方保留句柄以便将来 join。
 pub fn spawn_demux_thread(
     mut ictx: format::context::Input,
     video_index: Option<usize>,
@@ -106,7 +132,7 @@ pub fn spawn_demux_thread(
     video_tx: SyncSender<Packet>,
     audio_tx: SyncSender<Packet>,
     ctl: Arc<SeekCtl>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut seen = 0u64;
         'source: loop {
@@ -159,7 +185,8 @@ pub fn spawn_demux_thread(
         }
         // 循环结束（EOF/错误）后 sender 随线程退出而 drop，
         // 解码线程的 recv 返回 Err，触发各自的 flush 收尾。
-    });
+        info!("demux thread finished");
+    })
 }
 
 // 单个媒体源的流信息（各解码线程初始化用；struct 化避免字段错位）
@@ -184,18 +211,7 @@ pub fn extract_streams(ictx: &format::context::Input) -> Result<StreamInfo> {
             let dec = codec::context::Context::from_parameters(p.clone())?
                 .decoder()
                 .video()?;
-            let w = dec.width();
-            let h = dec.height();
-            let sar = dec.aspect_ratio();
-            // 变形宽银幕（sar != 1）按像素宽高比修正显示宽度
-            if sar.numerator() > 0 && sar.denominator() > 0 && sar.numerator() != sar.denominator()
-            {
-                let dw =
-                    ((w as u64 * sar.numerator() as u64) / sar.denominator() as u64).max(1) as u32;
-                (dw, h)
-            } else {
-                (w, h)
-            }
+            crate::frame::sar_corrected(dec.width(), dec.height(), dec.aspect_ratio())
         }
         None => return Err(anyhow::anyhow!("No video stream found")),
     };
@@ -262,5 +278,61 @@ mod tests {
         assert!(ctl.snapshot_new(0).is_none());
         assert_eq!(ctl.epoch(), 0);
         assert!(ctl.take_target(0).is_none());
+    }
+
+    // 原子镜像与权威状态保持一致：epoch() 无锁可读且不落后于 state
+    #[test]
+    fn epoch_mirror_tracks_state() {
+        let ctl = SeekCtl::new(1);
+        assert_eq!(ctl.epoch(), 0);
+
+        ctl.request(3.0);
+        assert_eq!(ctl.epoch(), 1, "镜像应已发布新代数");
+        let (e, _) = ctl.snapshot_new(0).unwrap();
+        assert_eq!(e, ctl.epoch());
+
+        ctl.request(4.0);
+        assert_eq!(ctl.epoch(), 2);
+        // 已处理到代数 2 后，快路径应报告"无新 seek"
+        assert!(ctl.snapshot_new(2).is_none());
+    }
+
+    // 原子快路径 + 锁内复核：并发连续 seek 时读到的 (代数, 目标) 必须配对，
+    // 不能出现"新代数配旧目标"（镜像先于 state 发布会破坏该不变量）
+    #[test]
+    fn snapshot_pairing_stays_consistent_under_concurrency() {
+        const N: u64 = 20_000;
+        let ctl = Arc::new(SeekCtl::new(1));
+        let writer = {
+            let ctl = ctl.clone();
+            std::thread::spawn(move || {
+                // 目标值恒等于其代数，便于校验配对
+                for e in 1..=N {
+                    ctl.request(e as f64);
+                }
+            })
+        };
+
+        let mut seen = 0u64;
+        let mut observations = 0u64;
+        while seen < N {
+            match ctl.snapshot_new(seen) {
+                None => {
+                    // 快路径返回"无新 seek"：该时刻镜像与本地代数相等。
+                    // 断言时可能又来了新 seek（下一轮轮询就会看到），故只校验不倒退
+                    let now = ctl.epoch();
+                    assert!(now >= seen, "代数倒退: {now} < {seen}");
+                }
+                Some((e, t)) => {
+                    assert!(e > seen, "代数必须单调前进: {e} <= {seen}");
+                    assert_eq!(t, Some(e as f64), "代数 {e} 配到了错位的目标 {t:?}");
+                    seen = e;
+                    observations += 1;
+                }
+            }
+        }
+        writer.join().unwrap();
+        assert!(observations > 0, "应至少观察到一次新代数");
+        assert_eq!(ctl.epoch(), N);
     }
 }

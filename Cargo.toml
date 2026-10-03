@@ -24,7 +24,15 @@ png = "0.18.1"
 ringbuf = "0.5.2"
 
 [profile.dev]
+# 开发时也让本 crate 的代码有基本优化，否则播放路径（YUV→RGB、重采样）
+# 在 debug 下慢到掩盖真实性能问题。
+# 注意：Cargo 的 profile 设置同样作用于依赖（实测依赖也被编成 opt-level=1）。
+# 若想让依赖保持 opt-level=0 以缩短依赖编译，可另加：
+#   [profile.dev.package."*"]
+#   opt-level = 0
 opt-level = 1
+# 行号表即可定位 panic，完整 debuginfo 会显著拖慢编译且占大量磁盘
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3

@@ -55,6 +55,19 @@ cargo build --release
 cargo run -- path/to/video.mp4
 ```
 
+`dev` profile 保留了 `opt-level = 1`（播放路径不至于慢到掩盖真实性能问题），
+debuginfo 设为 `line-tables-only` 以缩短编译时间。
+
+如需进一步优化本机性能（YUV→RGB 标量循环、音频重采样可吃到 SIMD），
+可在项目下创建 `.cargo/config.toml`：
+
+```toml
+[build]
+rustflags = ["-C", "target-cpu=native"]
+```
+
+注意这会让产物绑定当前 CPU，无法跨机分发。
+
 ## 使用方法
 
 播放一个或多个媒体源：
@@ -97,7 +110,7 @@ auv [options] <file_or_url>...
 | --- | --- |
 | `Space` | 暂停或恢复播放 |
 | `F` | 切换全屏 |
-| `S` | 将当前帧保存为 PNG 截图（保存到当前工作目录，文件名 `auv_<时间戳>.png`） |
+| `S` | 将当前帧保存为 PNG 截图（保存到当前工作目录，文件名 `auv_<时间戳>.<毫秒>.png`；编码在后台线程进行，不阻塞播放） |
 | `←` / `→` | 后退 / 前进 10 秒 |
 | `[` / `]` | 后退 / 前进 5 秒 |
 | `Home` | 跳到开头 |
@@ -115,16 +128,33 @@ auv [options] <file_or_url>...
 AUV 会先尝试让 FFmpeg 直接打开 HTTP/HTTPS 地址。直接打开失败后，会自动调用：
 
 ```text
-yt-dlp -q --no-playlist --merge-output-format mkv -o - <URL>
+yt-dlp -q --no-playlist -f 'bv*+ba/b' -S 'hdr:SDR' --merge-output-format mkv -o - <URL>
 ```
+
+其中 `-f 'bv*+ba/b'` 表示"最佳视频流 + 最佳音频流，失败再退回最佳单文件"。
+**这一步不能省**：yt-dlp 的默认格式选择对 DASH 分片站点（YouTube 等）会挑
+"已合一的最佳单文件"而非最佳视频流，实测会把 4K 视频降级到 360p，
+观感像是渲染发糊，实际是下载源被降级了。
+
+`-S 'hdr:SDR'` 表示同分辨率下优先选 SDR 版本。AUV 的渲染管线是 SDR；选中
+HDR10（PQ/BT.2020）源时若不处理，10bit→8bit 转换不会做 PQ→SDR 映射，画面会被
+当成 SDR 解码，颜色与对比度会明显不对。YouTube/B 站的 HDR 视频一般同时提供
+SDR 版本，优先 SDR 可保住 4K 且颜色正确（原生 SDR 通常也比 tone map 更准）。
+
+若某个视频**只有 HDR 版本**，AUV 会自动用 FFmpeg 的 `zscale` + `tonemap`
+把它 tone map 成 SDR BT.709 再渲染（支持 PQ/HDR10 与 HLG），颜色正确，
+但比直接播 SDR 更吃 CPU。需要 FFmpeg 带 `zscale`（libzimg）与 `tonemap`
+滤镜；缺失时会退回普通转换并打印告警。
 
 因此网页链接播放依赖 `yt-dlp` 对对应站点的支持。需要登录、Cookie 或浏览器鉴权时，请在 `~/.config/yt-dlp/config` 中配置 `yt-dlp` 选项，例如 `--cookies` 或 `--cookies-from-browser`。
 
 ## 注意事项
 
 - 项目当前要求输入源包含视频流；只有音频的文件会被跳过。
+- 播放 HDR 源时，若为 PQ/HDR10 或 HLG，会自动 tone map 成 SDR BT.709；无论来自网页链接还是直链均生效。
 - 音频默认重采样为立体声浮点格式，并输出到系统默认音频设备。
 - 播放多个源时，窗口会根据当前媒体的分辨率重新调整大小。
 - 网络流的可播放性和稳定性取决于 FFmpeg、网络环境以及 `yt-dlp` 对目标站点的支持。
+- 打开媒体源有 20 秒超时（FFmpeg 的打开与探测是阻塞 I/O，网络不通时若无超时会一直挂死）。超时后该源被跳过，播放列表继续。
 - 音频输出缓冲按设备支持范围放大到 2048 帧（≈43ms@48kHz），以减少偶发的 ALSA 下溢（`Audio Stream Error: ...I/O error`）；设备不支持时自动退而取上限或回退默认配置。音频输出仍偶发失效时，按设计降级为无声并用系统时钟同步，播放不中断。
 

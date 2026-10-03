@@ -2,7 +2,7 @@ use std::{
     cell::Cell,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -16,8 +16,8 @@ pub struct MasterClock {
     // keep get_time_sec 的基准偏移：seek 后把基准跳到目标点，各处时间线对齐
     base_sec: Cell<f64>,
     has_audio: bool,
-    // 音频输出失效（设备出错等）时置 1：主时钟退回系统时钟继续播放
-    audio_dead: Arc<AtomicU64>,
+    // 音频输出失效（设备出错等）时置 true：主时钟退回系统时钟继续播放
+    audio_dead: Arc<AtomicBool>,
     // 无音频模式下累计的暂停时长（纳秒）：暂停期间墙钟仍在走，
     // 恢复后扣除这部分，避免视频帧被误判为迟到而全部丢弃
     paused_nanos: AtomicU64,
@@ -29,7 +29,7 @@ impl MasterClock {
         sample_rate: u32,
         channels: u32,
         has_audio: bool,
-        audio_dead: Arc<AtomicU64>,
+        audio_dead: Arc<AtomicBool>,
     ) -> (Self, Arc<AtomicU64>) {
         let samples_played = Arc::new(AtomicU64::new(0));
         let clock = Self {
@@ -72,7 +72,7 @@ impl MasterClock {
     // 获取声卡当前播放到的绝对时间（秒）
     pub fn get_time_sec(&self) -> f64 {
         let audio_ok =
-            self.has_audio && self.sample_rate > 0 && self.audio_dead.load(Ordering::Relaxed) == 0;
+            self.has_audio && self.sample_rate > 0 && !self.audio_dead.load(Ordering::Relaxed);
         if audio_ok {
             let samples = self.samples_played.load(Ordering::Relaxed) as f64;
             self.base_sec.get() + samples / (self.sample_rate as f64 * self.channels as f64)

@@ -2,19 +2,20 @@
 // 主程序只负责装配与源循环，窗口回调（绘制/按键）与纯展示换算都归这里。
 use cpal::traits::StreamTrait;
 use fltk::{app, prelude::*, window::GlWindow};
-use log::{error, info};
+use log::info;
 use std::{
     cell::RefCell,
     rc::Rc,
     sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc,
     },
 };
 
 use crate::{
     frame::YuvFrame,
+    pause::PauseGate,
     render::{self, draw_frame},
 };
 
@@ -27,9 +28,9 @@ pub struct PlayerState {
     pub frame_store: Rc<RefCell<Option<YuvFrame>>>,
     pub seek_handle: Rc<RefCell<Option<Arc<crate::demux::SeekCtl>>>>,
     pub dur_handle: Rc<RefCell<f64>>,
-    pub paused: Arc<(Mutex<bool>, Condvar)>,
-    pub volume: Arc<AtomicU64>,
-    pub mute: Arc<AtomicU64>,
+    pub paused: Arc<PauseGate>,
+    pub volume: Arc<AtomicU32>,
+    pub mute: Arc<AtomicBool>,
 }
 
 impl PlayerState {
@@ -40,9 +41,9 @@ impl PlayerState {
             frame_store: Rc::new(RefCell::new(None)),
             seek_handle: Rc::new(RefCell::new(None)),
             dur_handle: Rc::new(RefCell::new(0.0)),
-            paused: Arc::new((Mutex::new(false), Condvar::new())),
-            volume: Arc::new(AtomicU64::new(100)),
-            mute: Arc::new(AtomicU64::new(0)),
+            paused: Arc::new(PauseGate::new()),
+            volume: Arc::new(AtomicU32::new(100)),
+            mute: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -88,10 +89,9 @@ pub fn register_window_callbacks(
         if ev == fltk::enums::Event::KeyDown {
             let key = app::event_key();
             if key == fltk::enums::Key::from_char(' ') {
-                // 在锁内翻转暂停状态并通知视频线程，避免通知丢失导致其永久睡眠
-                let mut guard = paused_keys.0.lock().unwrap();
-                *guard = !*guard;
-                let paused_now = *guard;
+                // 翻转暂停并唤醒等待中的解码线程
+                //（状态变更与 notify 在 PauseGate 内同一临界区完成，不会丢通知）
+                let paused_now = paused_keys.toggle();
                 if let Some(s) = stream_handle_keys.borrow().as_ref() {
                     if paused_now {
                         let _ = s.pause();
@@ -99,7 +99,6 @@ pub fn register_window_callbacks(
                         let _ = s.play();
                     }
                 }
-                paused_keys.1.notify_all();
             } else if key == fltk::enums::Key::from_char('f')
                 || key == fltk::enums::Key::from_char('F')
             {
@@ -111,12 +110,13 @@ pub fn register_window_callbacks(
             } else if key == fltk::enums::Key::from_char('s')
                 || key == fltk::enums::Key::from_char('S')
             {
-                // 把当前显示的帧存为 PNG 截图（保存到当前工作目录）
+                // 把当前显示的帧交给后台线程转 RGB 并编码 PNG：
+                // 转换与压缩是 O(像素数) 的 CPU 工作，在 UI 线程做会冻结窗口。
+                // 快照（几次 memcpy）延迟到 spawn_save 确认没有任务在跑后才取，
+                // 避免连按 S 时白做整帧拷贝；它仍在 UI 线程完成，因为回收后的
+                // 帧会立刻被解码器重填，后台线程直接读会与解码竞争
                 if let Some(frame) = frame_store_keys.borrow().as_ref() {
-                    match crate::screenshot::save_screenshot(frame) {
-                        Ok(p) => info!("Screenshot saved: {}", p.display()),
-                        Err(e) => error!("Screenshot failed: {}", e),
-                    }
+                    crate::screenshot::spawn_save(|| frame.snapshot());
                 }
             } else if key == fltk::enums::Key::Left
                 || key == fltk::enums::Key::Right
@@ -156,7 +156,7 @@ pub fn register_window_callbacks(
                     };
                     ctl.request(target);
                     // 唤醒暂停中阻塞在条件变量上的解码线程，让它们立即处理 seek
-                    paused_keys.1.notify_all();
+                    paused_keys.wake();
                 }
             } else if key == fltk::enums::Key::from_char('+')
                 || key == fltk::enums::Key::from_char('=')
@@ -177,8 +177,8 @@ pub fn register_window_callbacks(
             } else if key == fltk::enums::Key::from_char('m')
                 || key == fltk::enums::Key::from_char('M')
             {
-                let was = mute_keys.fetch_xor(1, Ordering::Relaxed);
-                info!("Mute: {}", if was == 0 { "ON" } else { "OFF" });
+                let was_muted = mute_keys.fetch_xor(true, Ordering::Relaxed);
+                info!("Mute: {}", if was_muted { "OFF" } else { "ON" });
             }
         }
         false

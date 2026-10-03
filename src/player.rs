@@ -8,7 +8,7 @@ use fltk::{app, prelude::*, window::GlWindow};
 use log::{error, info, warn};
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     mpsc,
 };
 
@@ -17,6 +17,7 @@ use crate::{
     clock::MasterClock,
     demux::{self, SeekCtl, StreamInfo, extract_streams},
     frame::{Message, YuvFrame},
+    source::SourceShared,
     ui::{self, PlayerState, calc_display_size, format_time},
     util, video,
 };
@@ -118,7 +119,7 @@ impl Player {
         // 纯视频源若被当成有音频，采样计数永不推进，主时钟停在 0，视频会卡死首帧。
         // audio_dead：音频输出失效标记，出错时置 1，主时钟回退墙钟、
         // 音频线程中止，避免设备挂掉后播放永久卡死；每源独立避免旧流污染新源
-        let audio_dead = Arc::new(AtomicU64::new(0));
+        let audio_dead = Arc::new(AtomicBool::new(false));
         let has_audio = self.audio.config.is_some() && audio_index.is_some();
         let (master_clock, samples_played_arc) = MasterClock::new(
             self.audio.sample_rate,
@@ -137,15 +138,15 @@ impl Player {
             && audio_index.is_some()
         {
             let build = |cfg: &cpal::StreamConfig| {
-                audio::build_output_stream(
+                audio::build_output_stream(audio::AudioOutParams {
                     device,
-                    cfg,
-                    &samples_played_arc,
-                    &audio_dead,
-                    &volume,
-                    &mute,
-                    &ring_clear,
-                )
+                    config: cfg,
+                    samples_played: &samples_played_arc,
+                    audio_dead: &audio_dead,
+                    volume: &volume,
+                    mute: &mute,
+                    ring_clear: &ring_clear,
+                })
             };
             // 首选放大后的固定缓冲粒度；设备声明的范围可能失真（如 ALSA 经
             // PipeWire 插件时在设定采样率后才把 period 固定为 1024），建流失败
@@ -166,7 +167,7 @@ impl Player {
                 Err(e) => {
                     // 建流彻底失败：置失效标记让主时钟退回墙钟，否则采样计数
                     // 永不推进，视频会卡死首帧
-                    audio_dead.store(1, Ordering::Relaxed);
+                    audio_dead.store(true, Ordering::Relaxed);
                     error!("Audio output init failed: {}", e);
                     (None, None)
                 }
@@ -191,8 +192,7 @@ impl Player {
         };
 
         // 换源时复位暂停状态
-        *paused.0.lock().unwrap() = false;
-        paused.1.notify_all();
+        paused.reset();
 
         // 本源的通道与线程。
         // 有界 sync_channel：UI 线程卡顿（如合成器阻塞 swap）时视频线程在 send
@@ -219,15 +219,24 @@ impl Player {
 
         // 音频是否已全部播完（含环形缓冲排空）。视频线程据此决定何时结束播放，
         // 避免视频先播完就把还没播出的音频尾部截断。
-        let audio_done = Arc::new(AtomicU64::new(0));
+        let audio_done = Arc::new(AtomicBool::new(false));
         // 视频线程在"等音频播完"时阻塞于此，由音频线程播完时唤醒，避免忙轮询
         let sync = Arc::new((Mutex::new(()), Condvar::new()));
 
         // 无音频输出或无音频流时，直接标记音频完成
         if audio_producer.is_none() || audio_index.is_none() {
-            audio_done.store(1, Ordering::Relaxed);
+            audio_done.store(true, Ordering::Relaxed);
             sync.1.notify_all();
         }
+
+        // 本源各线程共享的句柄（暂停门 / seek 协调器 / 音频结束与失效标记）
+        let shared = Arc::new(SourceShared::new(
+            paused.clone(),
+            audio_done.clone(),
+            audio_dead.clone(),
+            sync.clone(),
+            seek_ctl.clone(),
+        ));
 
         // 音频解码线程：从 demux 通道收 packet 解码、重采样后喂入环形缓冲
         if let (Some(producer), Some(audio_parameters)) = (audio_producer.take(), audio_params)
@@ -239,11 +248,7 @@ impl Player {
                 producer,
                 sample_rate: self.audio.sample_rate,
                 channels: self.audio.channels,
-                audio_done: audio_done.clone(),
-                done_cond: sync.clone(),
-                paused: paused.clone(),
-                audio_dead: audio_dead.clone(),
-                ctl: seek_ctl.clone(),
+                shared: shared.clone(),
                 samples_played: samples_played_arc.clone(),
                 ring_clear: ring_clear.clone(),
             });
@@ -254,13 +259,10 @@ impl Player {
             tx,
             recycle_rx,
             clock: master_clock,
-            paused: paused.clone(),
-            audio_done: audio_done.clone(),
-            sync: sync.clone(),
+            shared: shared.clone(),
             video_rx,
             video_parameters: video_params,
             video_time_base,
-            ctl: seek_ctl.clone(),
         });
 
         self.played_any = true;
@@ -270,43 +272,80 @@ impl Player {
         // 上次写进窗口标题的整秒进度：只有整秒变化才重设标题，避免每帧刷新
         let mut last_title_sec = u64::MAX;
 
+        // 消息泵退出的三种原因
+        enum PumpExit {
+            Empty,        // 队列已空，回到事件循环等待
+            End,          // 正常播完
+            Disconnected, // 所有 sender 已释放（视频线程 panic/异常退出）
+        }
+
         while self.app.wait() && !finished {
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    Message::Frame(new_frame) => {
-                        // 进度显示：窗口标题反映当前播放位置/总时长
-                        let cur_sec = new_frame.pts_sec;
-                        if cur_sec as u64 != last_title_sec {
-                            last_title_sec = cur_sec as u64;
-                            let dur = *dur_handle.borrow();
-                            let label = if dur > 0.0 {
-                                format!(
-                                    "{} [{}/{}]",
-                                    title_base,
-                                    format_time(cur_sec),
-                                    format_time(dur)
-                                )
-                            } else {
-                                format!("{} [{}]", title_base, format_time(cur_sec))
-                            };
-                            self.win.set_label(&label);
+            let reason = loop {
+                match rx.try_recv() {
+                    Ok(msg) => match msg {
+                        Message::Frame(new_frame) => {
+                            // 丢弃 seek 之前的残留帧：用户按下 seek 到新位置后，
+                            // 通道里可能还压着 1~2 帧旧位置的画面，直接显示会
+                            // 闪一下旧画面再跳到新位置。seek 不改变 local_epoch，
+                            // 所以按代数比较即可，无需额外的清通道逻辑
+                            if new_frame.seek_epoch != seek_ctl.epoch() {
+                                // 顺带把它还给解码线程复用（帧仍持有像素缓冲）
+                                if let Some(tx) = self.state.recycle_handle.borrow().as_ref() {
+                                    let _ = tx.send(new_frame);
+                                }
+                                continue;
+                            }
+                            // 进度显示：窗口标题反映当前播放位置/总时长
+                            let cur_sec = new_frame.pts_sec;
+                            if cur_sec as u64 != last_title_sec {
+                                last_title_sec = cur_sec as u64;
+                                let dur = *dur_handle.borrow();
+                                let label = if dur > 0.0 {
+                                    format!(
+                                        "{} [{}/{}]",
+                                        title_base,
+                                        format_time(cur_sec),
+                                        format_time(dur)
+                                    )
+                                } else {
+                                    format!("{} [{}]", title_base, format_time(cur_sec))
+                                };
+                                self.win.set_label(&label);
+                            }
+                            if let Some(old_frame) =
+                                self.state.frame_store.borrow_mut().replace(new_frame)
+                                && let Some(tx) = self.state.recycle_handle.borrow().as_ref()
+                            {
+                                let _ = tx.send(old_frame);
+                            }
+                            self.win.redraw();
                         }
-                        if let Some(old_frame) =
-                            self.state.frame_store.borrow_mut().replace(new_frame)
-                            && let Some(tx) = self.state.recycle_handle.borrow().as_ref()
-                        {
-                            let _ = tx.send(old_frame);
-                        }
-                        self.win.redraw();
-                    }
-                    Message::End => {
-                        // 丢弃本源残留帧与通道，避免旧数据串到下一源
-                        self.state.frame_store.borrow_mut().take();
-                        *self.state.recycle_handle.borrow_mut() = None;
-                        *self.state.stream_handle.borrow_mut() = None;
-                        finished = true;
-                        break;
-                    }
+                        Message::End => break PumpExit::End,
+                    },
+                    // End 之外的终止条件：所有 sender 已释放
+                    Err(mpsc::TryRecvError::Disconnected) => break PumpExit::Disconnected,
+                    Err(mpsc::TryRecvError::Empty) => break PumpExit::Empty,
+                }
+            };
+
+            // End 与 Disconnected 都要收尾：丢弃本源残留帧与通道，
+            // 避免旧数据串到下一源
+            match reason {
+                PumpExit::Empty => {}
+                PumpExit::End => {
+                    self.state.frame_store.borrow_mut().take();
+                    *self.state.recycle_handle.borrow_mut() = None;
+                    *self.state.stream_handle.borrow_mut() = None;
+                    finished = true;
+                }
+                PumpExit::Disconnected => {
+                    // 视频线程 panic 或异常退出且没能发 End：app.wait() 会一直
+                    // 挂着，用户只看到窗口停在最后一帧。这里兜底结束本源
+                    error!("frame channel closed before End; ending source");
+                    self.state.frame_store.borrow_mut().take();
+                    *self.state.recycle_handle.borrow_mut() = None;
+                    *self.state.stream_handle.borrow_mut() = None;
+                    finished = true;
                 }
             }
         }
