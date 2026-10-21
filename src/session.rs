@@ -177,6 +177,8 @@ impl SourceSession {
             has_audio,
             audio_dead.clone(),
         );
+        // 设备播放延迟由 cpal 回调写入，主时钟用它扣掉"已交付但还没出声"的样本
+        let latency_arc = master_clock.latency_handle();
 
         // 环形缓冲清空标记：seek 时由音频线程置位，cpal 回调下次运行时清空
         let ring_clear = Arc::new(AtomicBool::new(false));
@@ -192,6 +194,7 @@ impl SourceSession {
                     device,
                     config: cfg,
                     samples_played: &samples_played_arc,
+                    latency: &latency_arc,
                     audio_dead: &audio_dead,
                     volume: &self.volume,
                     mute: &self.mute,
@@ -336,6 +339,7 @@ impl SourceSession {
             video_parameters: video_params,
             video_time_base,
             timeline_origin,
+            has_audio,
         }));
 
         self.rx = Some(rx);

@@ -18,6 +18,9 @@ pub struct SourceStats {
     pub late_dropped: AtomicU64,
     // 因持续迟到而发起的"追帧 seek"次数
     pub catchups: AtomicU64,
+    // 解码器返回的无效数据/硬件错误次数（EAGAIN 背压不计）。流损坏、驱动故障
+    // 时它增长，而画面只表现为"停住"，没有这个计数就完全看不出来
+    pub decode_errors: AtomicU64,
     // 走 EGL/DMABUF 零拷贝上屏的硬件帧数
     pub dmabuf_frames: AtomicU64,
     // cpal 报告的 xrun / 欠载
@@ -36,7 +39,7 @@ impl SourceStats {
 
     pub fn summary(&self) -> String {
         format!(
-            "decoded={} displayed={} late_dropped={} catchups={} dmabuf={} xruns={} underruns={}",
+            "decoded={} displayed={} late_dropped={} catchups={} dmabuf={} xruns={} underruns={} decode_errors={}",
             Self::get(&self.decoded),
             Self::get(&self.displayed),
             Self::get(&self.late_dropped),
@@ -44,6 +47,7 @@ impl SourceStats {
             Self::get(&self.dmabuf_frames),
             Self::get(&self.xruns),
             Self::get(&self.underruns),
+            Self::get(&self.decode_errors),
         )
     }
 }

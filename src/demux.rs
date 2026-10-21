@@ -18,6 +18,18 @@ pub struct TimedPacket {
     pub packet: Packet,
 }
 
+// 解码器返回 EAGAIN 只是"暂不收包 / 暂时没有更多帧"的背压，不是错误。
+// ffmpeg-next 把 AVERROR(EAGAIN) 归到 Error::Other { errno }，用 std 的 errno
+// 映射判断，避免在调用点手写平台常量。
+pub fn is_backpressure(e: &ffmpeg_next::Error) -> bool {
+    matches!(
+        e,
+        ffmpeg_next::Error::Other { errno }
+            if std::io::Error::from_raw_os_error(*errno).kind()
+                == std::io::ErrorKind::WouldBlock
+    )
+}
+
 // 一次 seek 的处理结果：demux 移动读位置之后发布，解码线程据此决定是否本地复位。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeekOutcome {

@@ -18,6 +18,11 @@ pub struct MasterClock {
     has_audio: bool,
     // 音频输出失效（设备出错等）时置 true：主时钟退回系统时钟继续播放
     audio_dead: Arc<AtomicBool>,
+    // 音频输出延迟（样本数 = 帧数×声道）：回调写入的样本要等驱动缓冲排空才真正
+    // 从设备播出。样本时钟减去它才是"此刻听到的位置"，否则视频会提前一个 period
+    latency_samples: Arc<AtomicU64>,
+    // 是否已从样本时钟切到墙钟：audio_dead 后只切换一次（见 get_time_sec）
+    wall_handover: Cell<bool>,
     // 无音频模式下累计的暂停时长（纳秒）：暂停期间墙钟仍在走，
     // 恢复后扣除这部分，避免视频帧被误判为迟到而全部丢弃
     paused_nanos: AtomicU64,
@@ -45,6 +50,8 @@ impl MasterClock {
             base_sec: Cell::new(0.0),
             has_audio,
             audio_dead,
+            latency_samples: Arc::new(AtomicU64::new(0)),
+            wall_handover: Cell::new(false),
             paused_nanos: AtomicU64::new(0),
             last_samples: Cell::new(0),
             last_sample_instant: Cell::new(Instant::now()),
@@ -84,22 +91,27 @@ impl MasterClock {
         self.samples_played.load(Ordering::Relaxed)
     }
 
+    // 供音频回调写入设备播放延迟（样本数）的共享句柄
+    pub fn latency_handle(&self) -> Arc<AtomicU64> {
+        self.latency_samples.clone()
+    }
+
     // 获取声卡当前播放到的绝对时间（秒）
     pub fn get_time_sec(&self) -> f64 {
         let audio_ok =
             self.has_audio && self.sample_rate > 0 && !self.audio_dead.load(Ordering::Relaxed);
         if audio_ok {
-            let raw = self.samples_played.load(Ordering::Relaxed);
-            if raw != self.last_samples.get() {
-                self.last_samples.set(raw);
-                self.last_sample_instant.set(Instant::now());
-            }
-            // 两次回调之间按墙钟外推，最多外推 50ms（覆盖 2048 帧@48k 的
-            // 一个缓冲周期）；欠载/暂停时不会无限跑快
-            let elapsed = self.last_sample_instant.get().elapsed().as_secs_f64();
-            let denom = self.sample_rate as f64 * self.channels as f64;
-            let extra = (elapsed * denom).min(denom * 0.050);
-            self.base_sec.get() + (raw as f64 + extra) / denom
+            self.sample_time()
+        } else if self.has_audio && !self.wall_handover.get() {
+            // 音频输出刚失效：以"最后听到的位置"接管墙钟基准。
+            // 直接切墙钟会把欠载/停顿累计的时间一次性算进去，时间瞬间前跳，
+            // 视频侧会判全体迟到并丢帧/追帧
+            let t = self.sample_time();
+            self.wall_handover.set(true);
+            self.base_sec.set(t);
+            self.start_instant.set(Instant::now());
+            self.paused_nanos.store(0, Ordering::Relaxed);
+            t
         } else {
             // 音频轨缺失、音频输出失效或声卡不可用时，退回系统时钟，
             // 并扣除暂停期间的墙钟漂移
@@ -107,6 +119,23 @@ impl MasterClock {
             let wall = (self.start_instant.get().elapsed().as_secs_f64() - paused).max(0.0);
             self.base_sec.get() + wall
         }
+    }
+
+    // 样本时钟：已交付样本 - 设备播放延迟，再在两次回调之间按墙钟外推。
+    // 外推最多 50ms（覆盖 2048 帧@48k 的一个缓冲周期），欠载/暂停时不会无限跑快
+    fn sample_time(&self) -> f64 {
+        let raw = self
+            .samples_played
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.latency_samples.load(Ordering::Relaxed));
+        if raw != self.last_samples.get() {
+            self.last_samples.set(raw);
+            self.last_sample_instant.set(Instant::now());
+        }
+        let elapsed = self.last_sample_instant.get().elapsed().as_secs_f64();
+        let denom = self.sample_rate as f64 * self.channels as f64;
+        let extra = (elapsed * denom).min(denom * 0.050);
+        self.base_sec.get() + (raw as f64 + extra) / denom
     }
 }
 
@@ -143,5 +172,50 @@ mod tests {
         assert!(t1 - t0 <= 0.051, "外推不得超过一个缓冲周期: {}", t1 - t0);
         clock.seek_to(5.0);
         assert!((clock.get_time_sec() - 5.0).abs() < 0.01);
+    }
+
+    // 设备播放延迟：已交付样本里还没真正出声的那部分不能算进当前时刻，
+    // 否则视频会系统性提前一个 period
+    #[test]
+    fn playback_latency_shifts_clock_back() {
+        let dead = Arc::new(AtomicBool::new(false));
+        let (clock, samples) = MasterClock::new(48_000, 2, true, dead);
+        samples.fetch_add(96_000, Ordering::Relaxed); // 1 秒已交付
+        clock.latency_handle().store(48_000, Ordering::Relaxed); // 0.5 秒仍在缓冲里
+        assert!(
+            (clock.get_time_sec() - 0.5).abs() < 0.06,
+            "应扣掉设备延迟: {}",
+            clock.get_time_sec()
+        );
+        clock.latency_handle().store(0, Ordering::Relaxed);
+        assert!((clock.get_time_sec() - 1.0).abs() < 0.06);
+    }
+
+    // 音频输出中途失效：切到墙钟必须在"最后听到的位置"上接管，
+    // 不能把欠载/驱动停顿累计的墙钟时间一次性算进去（时间前跳会引发丢帧风暴）
+    #[test]
+    fn audio_clock_hands_over_to_wall_clock_without_jump() {
+        let dead = Arc::new(AtomicBool::new(false));
+        let (clock, samples) = MasterClock::new(48_000, 2, true, dead.clone());
+        samples.fetch_add(96_000, Ordering::Relaxed); // 1 秒
+        assert!((clock.get_time_sec() - 1.0).abs() < 0.06);
+
+        // 墙钟又走了 200ms 但样本计数没动（欠载）：直接切墙钟会前跳 200ms
+        std::thread::sleep(Duration::from_millis(200));
+        dead.store(true, Ordering::Relaxed);
+        let at_switch = clock.get_time_sec();
+        assert!(
+            (at_switch - 1.0).abs() < 0.08,
+            "切换瞬间必须停在音频位置: {at_switch}"
+        );
+
+        // 之后按墙钟继续前进
+        std::thread::sleep(Duration::from_millis(30));
+        let later = clock.get_time_sec();
+        assert!(later > at_switch, "切墙钟后必须继续走");
+        assert!(
+            (later - at_switch - 0.03).abs() < 0.04,
+            "墙钟只应计入切换后的时间: {later} vs {at_switch}"
+        );
     }
 }

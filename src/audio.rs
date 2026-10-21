@@ -16,7 +16,7 @@ use std::{
 };
 
 use crate::{
-    demux::{SeekCtl, SeekOutcome, TimedPacket},
+    demux::{SeekCtl, SeekOutcome, TimedPacket, is_backpressure},
     source::{SourceShared, SourceStats},
 };
 
@@ -355,6 +355,20 @@ impl AudioThread {
         Ok(())
     }
 
+    // 解码器报错（EAGAIN 背压除外）：计数，首个错误打一条日志。
+    // 音频侧原来这些错误也被 `let _` 吞掉，设备/流异常时只剩"没声音"
+    fn note_decode_error(&self, stage: &str, e: &ffmpeg_next::Error) {
+        if self
+            .shared
+            .stats
+            .decode_errors
+            .fetch_add(1, Ordering::Relaxed)
+            == 0
+        {
+            warn!("audio decoder {stage} failed: {e} (further decode errors are counted in stats)");
+        }
+    }
+
     fn run(&mut self) -> Result<()> {
         let mut eof = false;
         let mut dead = false;
@@ -397,18 +411,39 @@ impl AudioThread {
                     if tp.epoch < self.packet_epoch_floor {
                         continue;
                     }
-                    let _ = self.decoder.send_packet(&tp.packet);
+                    let sent = self.decoder.send_packet(&tp.packet);
+                    if let Err(e) = sent
+                        && !is_backpressure(&e)
+                    {
+                        self.note_decode_error("send_packet", &e);
+                    }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = self.decoder.send_eof();
+                    let sent = self.decoder.send_eof();
+                    if let Err(e) = sent
+                        && !is_backpressure(&e)
+                    {
+                        self.note_decode_error("send_eof", &e);
+                    }
                     eof = true;
                 }
             }
             // 复用的解码输出帧：receive_frame 内部先 unref 再重填，跨 packet
             // 复用安全（原先每个 packet 新建一个 AVFrame）。它只作为重采样器
             // 的输入，run 期间数据即被拷走，不跨迭代持有引用。
-            while self.decoder.receive_frame(&mut decoded).is_ok() {
+            // EAGAIN（暂无更多帧）与 EOF 是正常收尾，其余错误计数并记一条日志
+            loop {
+                let received = self.decoder.receive_frame(&mut decoded);
+                match received {
+                    Ok(()) => {}
+                    Err(e) if is_backpressure(&e) => break,
+                    Err(ffmpeg_next::Error::Eof) => break,
+                    Err(e) => {
+                        self.note_decode_error("receive_frame", &e);
+                        break;
+                    }
+                }
                 let out_cap = (decoded.samples() as f64 * self.sample_rate as f64 / self.src_rate)
                     .ceil() as usize
                     + 1;
@@ -538,6 +573,8 @@ pub struct AudioOutParams<'a> {
     pub device: &'a cpal::Device,
     pub config: &'a cpal::StreamConfig,
     pub samples_played: &'a Arc<AtomicU64>,
+    // 设备播放延迟（样本数）：回调写入后要等这么久才真正出声，主时钟据此回退
+    pub latency: &'a Arc<AtomicU64>,
     pub audio_dead: &'a Arc<AtomicBool>,
     pub volume: &'a Arc<AtomicU32>,
     pub mute: &'a Arc<AtomicBool>,
@@ -557,6 +594,7 @@ pub fn build_output_stream(
         device,
         config,
         samples_played,
+        latency,
         audio_dead,
         volume,
         mute,
@@ -575,15 +613,19 @@ pub fn build_output_stream(
     let space = AudioSpace::new();
     let space_cb = space.clone();
     let samples_played_cb = samples_played.clone();
+    let latency_cb = latency.clone();
     let audio_dead_cb = audio_dead.clone();
     let volume_cb = volume.clone();
     let mute_cb = mute.clone();
     let ring_clear_cb = ring_clear.clone();
     let stats_cb = stats.clone();
     let stats_err = stats.clone();
+    // 回调里要用到的设备参数先拷成值，避免把 &StreamConfig 捕获进 'static 闭包
+    let cb_rate = config.sample_rate as f64;
+    let cb_channels = config.channels as u64;
     let stream = device.build_output_stream(
         *config,
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
             // seek 后清空旧音频：置位由音频线程发起，这里实际清空
             if ring_clear_cb.swap(false, Ordering::AcqRel) {
                 consumer.clear();
@@ -616,6 +658,21 @@ pub fn build_output_stream(
             // 视频从 pts≈0 起同步；中途下溢时时钟暂停，视频等待
             // 而非丢帧，保持音画对齐（无声卡时退回系统时钟）
             samples_played_cb.fetch_add(filled as u64, Ordering::Relaxed);
+            // 设备播放延迟：本回调写入的样本还要等驱动缓冲排空才真正播出。
+            // 主时钟减去它才是"此刻听到的位置"；否则样本时钟永远比实际出声
+            // 早一个（或多个）period，视频会系统性提前 20~40ms。
+            // playback/callback 为同一时钟源的两个时刻，相减即排空延迟；
+            // 取不到时退回"一个 period"（data 就是当前 period 的长度）。
+            let ts = info.timestamp();
+            let delay = ts.playback.duration_since(ts.callback);
+            let frames = if delay.is_zero() {
+                data.len() as u64 / cb_channels.max(1)
+            } else {
+                (delay.as_secs_f64() * cb_rate).round() as u64
+            };
+            // 上限 250ms：驱动上报异常大的延迟时不能把时钟拖死
+            let frames = frames.min((cb_rate * 0.25) as u64);
+            latency_cb.store(frames * cb_channels, Ordering::Relaxed);
         },
         move |err| {
             if err.kind() == cpal::ErrorKind::Xrun {

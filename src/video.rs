@@ -18,7 +18,7 @@ use std::{
 
 use crate::{
     clock::MasterClock,
-    demux::{SeekCtl, SeekOutcome, TimedPacket},
+    demux::{SeekCtl, SeekOutcome, TimedPacket, is_backpressure},
     dmabuf::DmaBufFrame,
     frame::{ChromaLayout, Message, YuvFrame, linesize, sar_corrected},
     source::SourceShared,
@@ -77,6 +77,9 @@ pub struct VideoThreadCtx {
     pub video_rx: Receiver<TimedPacket>,
     pub video_parameters: Option<codec::parameters::Parameters>,
     pub video_time_base: Option<ffmpeg_next::Rational>,
+    // 本源是否有可用的音频时钟（与 session 的 has_audio 一致）：音频播完后
+    // 采样时钟不再前进，同步等待必须立刻放弃（见 process_frame）
+    pub has_audio: bool,
     // 容器时间轴原点（秒）：视频 PTS 归一化用，见 demux::timeline_origin
     pub timeline_origin: f64,
 }
@@ -200,6 +203,7 @@ struct VideoThread {
     video_rx: Receiver<TimedPacket>,
     clock: MasterClock,
     shared: Arc<SourceShared>,
+    has_audio: bool,
 }
 
 impl VideoThread {
@@ -213,6 +217,7 @@ impl VideoThread {
             video_parameters,
             video_time_base,
             timeline_origin,
+            has_audio,
         } = ctx;
         let (decoder, hw_kind) = match video_parameters {
             Some(params) => {
@@ -247,6 +252,7 @@ impl VideoThread {
             video_rx,
             clock,
             shared,
+            has_audio,
         })
     }
 
@@ -385,27 +391,56 @@ impl VideoThread {
                     if tp.epoch < self.packet_epoch_floor {
                         continue;
                     }
-                    let _ = self.decoder.as_mut().unwrap().send_packet(&tp.packet);
+                    let sent = self.decoder.as_mut().unwrap().send_packet(&tp.packet);
+                    if let Err(e) = sent
+                        && !is_backpressure(&e)
+                    {
+                        self.note_decode_error("send_packet", &e);
+                    }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = self.decoder.as_mut().unwrap().send_eof();
+                    let sent = self.decoder.as_mut().unwrap().send_eof();
+                    if let Err(e) = sent
+                        && !is_backpressure(&e)
+                    {
+                        self.note_decode_error("send_eof", &e);
+                    }
                     eof = true;
                 }
             }
-            while self
-                .decoder
-                .as_mut()
-                .unwrap()
-                .receive_frame(&mut target)
-                .is_ok()
-            {
-                // process_frame 发布成功时会把 target 的像素所有权移进 YuvFrame
-                // 并补上一个新的目标帧（回收来的或新建的）
-                self.process_frame(&mut target);
+            // EAGAIN（本轮没有更多帧）与 EOF 都是正常收尾，不能算解码错误；
+            // 其余错误（InvalidData / External 等）计数并留一条日志。
+            // process_frame 发布成功时会把 target 的像素所有权移进 YuvFrame
+            // 并补上一个新的目标帧（回收来的或新建的）
+            loop {
+                let received = self.decoder.as_mut().unwrap().receive_frame(&mut target);
+                match received {
+                    Ok(()) => self.process_frame(&mut target),
+                    Err(e) if is_backpressure(&e) => break,
+                    Err(ffmpeg_next::Error::Eof) => break,
+                    Err(e) => {
+                        self.note_decode_error("receive_frame", &e);
+                        break;
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    // 解码器报错（EAGAIN 背压除外）：计数，首个错误打一条日志。流损坏/驱动
+    // 故障时原来这些错误被 `let _` 吞掉，表现为画面停住但日志和 stats 都干净
+    fn note_decode_error(&self, stage: &str, e: &ffmpeg_next::Error) {
+        if self
+            .shared
+            .stats
+            .decode_errors
+            .fetch_add(1, Ordering::Relaxed)
+            == 0
+        {
+            warn!("decoder {stage} failed: {e} (further decode errors are counted in stats)");
+        }
     }
 
     // 取一个可复用的接收目标帧：优先用 UI 回收回来的（连同其像素缓冲），
@@ -542,6 +577,13 @@ impl VideoThread {
                 }
                 let now = self.clock.get_time_sec();
                 if now >= video_pts_sec {
+                    break;
+                }
+                // 音频已经播完（含解码线程异常退出）：采样计数不会再前进，
+                // 等一个永远到不了的时间点会把整个源挂死。片尾视频比音频长
+                // 几毫秒、或音频包损坏丢了一小段时都会必现——直接显示本帧，
+                // 让解码循环尽快走到 EOF 收尾
+                if self.has_audio && self.shared.audio_done.load(Ordering::Relaxed) {
                     break;
                 }
                 let remain = video_pts_sec - now;
