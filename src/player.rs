@@ -334,7 +334,6 @@ impl Player {
             ytdlp_child: child,
             watchdog,
             info,
-            title: title_base,
             dur,
             paused: self.state.paused.clone(),
             volume: self.state.volume.clone(),

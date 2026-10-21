@@ -31,6 +31,9 @@ type ColorKey = (
 // 渲染状态：PBO 三缓冲 id（每帧一个缓冲，三个平面连续存放）与已分配容量、
 // 纹理尺寸跟踪、当前缓冲索引、色彩 uniform 位置、每缓冲的异步上传同步对象
 pub struct RenderState {
+    // 视频路径的 program 与 VAO（draw_frame 每帧绑定：文本 OSD 会切换自己的）
+    program: u32,
+    vao: u32,
     pbo: [u32; 3],
     // 三个采样单元对应的纹理对象（DMABUF 导入时直接替换其存储）
     textures: [u32; 3],
@@ -61,6 +64,20 @@ pub struct RenderState {
     dmabuf_retained: RefCell<Vec<RetainedDmaBuf>>,
     // 截图请求：DMA-BUF 帧没有 CPU 平面，改在绘制后用 glReadPixels 取回
     snap_request: Arc<AtomicBool>,
+    // 时间 OSD：最小纯色 program + 独立 VAO/VBO；顶点只在文字/窗口尺寸变化时重建
+    text_program: u32,
+    text_vao: u32,
+    text_vbo: u32,
+    text_color_loc: i32,
+    text_cache: RefCell<TextCache>,
+}
+
+// 已上传到 text_vbo 的 OSD 顶点：文字或窗口尺寸变化时才重建
+struct TextCache {
+    text: String,
+    w: i32,
+    h: i32,
+    verts: usize,
 }
 
 // 一个正在被 GPU 采样的 DMA-BUF 帧、其 EGLImage 与完成信号。
@@ -81,26 +98,10 @@ struct RetainedDmaBuf {
 /// `make_current()` 之后），并在同一线程上使用返回的 `RenderState`。
 pub unsafe fn setup_opengl(snap_request: Arc<AtomicBool>) -> RenderState {
     unsafe {
-        let vs_src = CString::new(include_str!("shaders/basic.vert.glsl")).unwrap();
-        let fs_src = CString::new(include_str!("shaders/basic.frag.glsl")).unwrap();
-
-        let vs = gl::CreateShader(gl::VERTEX_SHADER);
-        gl::ShaderSource(vs, 1, &vs_src.as_ptr(), std::ptr::null());
-        gl::CompileShader(vs);
-        log_shader_status(vs, "vertex");
-
-        let fs = gl::CreateShader(gl::FRAGMENT_SHADER);
-        gl::ShaderSource(fs, 1, &fs_src.as_ptr(), std::ptr::null());
-        gl::CompileShader(fs);
-        log_shader_status(fs, "fragment");
-
-        let shader_program = gl::CreateProgram();
-        gl::AttachShader(shader_program, vs);
-        gl::AttachShader(shader_program, fs);
-        gl::LinkProgram(shader_program);
-        gl::DeleteShader(vs);
-        gl::DeleteShader(fs);
-        log_program_status(shader_program);
+        let shader_program = build_program(
+            include_str!("shaders/basic.vert.glsl"),
+            include_str!("shaders/basic.frag.glsl"),
+        );
 
         gl::UseProgram(shader_program);
         let cmat_loc =
@@ -201,6 +202,34 @@ pub unsafe fn setup_opengl(snap_request: Arc<AtomicBool>) -> RenderState {
         gl::ActiveTexture(gl::TEXTURE2);
         gl::BindTexture(gl::TEXTURE_2D, textures[2]);
 
+        // 时间 OSD：独立的最小 program + VAO/VBO（顶点为 NDC 坐标，纯色着色）。
+        // 与视频共用上下文，但属性布局不同，必须是另一个 VAO
+        let text_program = build_program(
+            include_str!("shaders/overlay.vert.glsl"),
+            include_str!("shaders/overlay.frag.glsl"),
+        );
+        gl::UseProgram(text_program);
+        let text_color_loc =
+            gl::GetUniformLocation(text_program, CString::new("uColor").unwrap().as_ptr());
+        let mut text_vao = 0;
+        let mut text_vbo = 0;
+        gl::GenVertexArrays(1, &mut text_vao);
+        gl::GenBuffers(1, &mut text_vbo);
+        gl::BindVertexArray(text_vao);
+        gl::BindBuffer(gl::ARRAY_BUFFER, text_vbo);
+        gl::VertexAttribPointer(
+            0,
+            2,
+            gl::FLOAT,
+            gl::FALSE,
+            2 * std::mem::size_of::<f32>() as i32,
+            std::ptr::null(),
+        );
+        gl::EnableVertexAttribArray(0);
+        // 恢复视频路径的 program/VAO 绑定（draw_frame 每帧也会重新绑定）
+        gl::UseProgram(shader_program);
+        gl::BindVertexArray(vao);
+
         // PBO 三缓冲：每帧一个缓冲，Y/U/V 平面按 16B 对齐连续存放；轮转写入，
         // 隐藏 GPU 异步上传的等待。存储首次使用（或换分辨率）时按需分配。
         let mut pbo = [0u32; 3];
@@ -215,6 +244,8 @@ pub unsafe fn setup_opengl(snap_request: Arc<AtomicBool>) -> RenderState {
         }
 
         let state = RenderState {
+            program: shader_program,
+            vao,
             pbo,
             textures,
             pbo_cap: Cell::new([0; 3]),
@@ -233,6 +264,16 @@ pub unsafe fn setup_opengl(snap_request: Arc<AtomicBool>) -> RenderState {
             egl,
             dmabuf_retained: RefCell::new(Vec::new()),
             snap_request,
+            text_program,
+            text_vao,
+            text_vbo,
+            text_color_loc,
+            text_cache: RefCell::new(TextCache {
+                text: String::new(),
+                w: 0,
+                h: 0,
+                verts: 0,
+            }),
         };
         check_gl_error("setup_opengl");
         state
@@ -244,6 +285,9 @@ pub unsafe fn setup_opengl(snap_request: Arc<AtomicBool>) -> RenderState {
 // 再 TexSubImage2D 让 GPU 异步 DMA 到纹理，三缓冲 + fence 避免 CPU 阻塞等待上传。
 pub fn draw_frame(w: &mut GlWindow, state: &RenderState, frame: &YuvFrame) {
     unsafe {
+        // 文本 OSD 会切换 program/VAO，这里显式恢复视频路径的绑定
+        gl::UseProgram(state.program);
+        gl::BindVertexArray(state.vao);
         // HiDPI/Wayland 下 GL 视口以物理像素计，用 pixel_* 而非逻辑尺寸
         let win_w = w.pixel_w() as f32;
         let win_h = w.pixel_h() as f32;
@@ -442,6 +486,123 @@ pub fn draw_frame(w: &mut GlWindow, state: &RenderState, frame: &YuvFrame) {
         // 截图：DMA-BUF 帧没有 CPU 平面，从当前 back buffer 读回视频区域
         state.capture_if_requested(vp_x, vp_y, vp_w as i32, vp_h as i32);
     }
+}
+
+// 右上角时间 OSD：文字画成一组 NDC 矩形（3×5 点阵），带半透明底衬。
+// 放在视频之后、swap 之前；截图读回在 draw_frame 内部完成，因此不会把 OSD 拍进去。
+pub fn draw_time_overlay(w: &GlWindow, state: &RenderState, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let (win_w, win_h) = (w.pixel_w(), w.pixel_h());
+    if win_w <= 0 || win_h <= 0 {
+        return;
+    }
+    unsafe {
+        let mut cache = state.text_cache.borrow_mut();
+        // 文字每秒才变一次、窗口尺寸很少变：只有变化时才重建并上传顶点
+        if cache.text != text || cache.w != win_w || cache.h != win_h {
+            let verts = time_verts(text, win_w, win_h);
+            gl::BindVertexArray(state.text_vao);
+            gl::BindBuffer(gl::ARRAY_BUFFER, state.text_vbo);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                (verts.len() * std::mem::size_of::<f32>()) as isize,
+                verts.as_ptr() as *const _,
+                gl::STREAM_DRAW,
+            );
+            cache.text.clear();
+            cache.text.push_str(text);
+            cache.w = win_w;
+            cache.h = win_h;
+            cache.verts = verts.len() / 2;
+        }
+
+        // 视口恢复成整个窗口（draw_frame 把它设成了视频区域）
+        gl::Viewport(0, 0, win_w, win_h);
+        gl::UseProgram(state.text_program);
+        gl::BindVertexArray(state.text_vao);
+        gl::Enable(gl::BLEND);
+        gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+        // 前 6 个顶点是背景，其余是文字点阵
+        gl::Uniform4f(state.text_color_loc, 0.0, 0.0, 0.0, 0.55);
+        gl::DrawArrays(gl::TRIANGLES, 0, 6);
+        let glyphs = cache.verts.saturating_sub(6);
+        if glyphs > 0 {
+            gl::Uniform4f(state.text_color_loc, 1.0, 1.0, 1.0, 0.95);
+            gl::DrawArrays(gl::TRIANGLES, 6, glyphs as i32);
+        }
+        gl::Disable(gl::BLEND);
+    }
+}
+
+// 3×5 点阵字形：每行 3 bit，最高位在左。只覆盖时间显示需要的字符，
+// 其余字符（空格等）只占位不画点
+fn glyph(c: char) -> Option<[u8; 5]> {
+    Some(match c {
+        '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
+        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
+        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
+        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
+        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
+        '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
+        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
+        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
+        ':' => [0b000, 0b010, 0b000, 0b010, 0b000],
+        '/' => [0b001, 0b001, 0b010, 0b100, 0b100],
+        '-' => [0b000, 0b000, 0b111, 0b000, 0b000],
+        _ => return None,
+    })
+}
+
+// 生成 OSD 顶点：先是背景矩形（6 顶点），再是每个点亮像素的矩形（各 6 顶点）。
+// 坐标为 NDC；点阵像素边长随窗口高度缩放（1080p 下字形约 25px 高）
+fn time_verts(text: &str, win_w: i32, win_h: i32) -> Vec<f32> {
+    let chars = text.chars().count() as i32;
+    // 字号随窗口高度缩放，同时保证整块 OSD（含底衬、边距）不超出窗口宽度
+    let s = ((win_h as f32 / 200.0).round() as i32).clamp(2, 8);
+    let s = s.min((win_w / (4 * chars + 1)).max(1));
+    let margin = 3 * s;
+    let advance = 4 * s;
+    let width = (chars * advance - s).max(s);
+    let x0 = win_w - margin - width;
+    // 像素坐标系 y 向下：顶部就是 margin（glyph 从这里向下排 5 行点阵）
+    let y0 = margin;
+    let pad = 2 * s;
+    let mut v = Vec::with_capacity(6 + text.len() * 15 * 6 * 2);
+    rect(
+        &mut v,
+        x0 - pad,
+        y0 - pad,
+        x0 + width + pad,
+        y0 + 5 * s + pad,
+        win_w,
+        win_h,
+    );
+    for (i, c) in text.chars().enumerate() {
+        let Some(g) = glyph(c) else { continue };
+        let gx = x0 + i as i32 * advance;
+        for (row, bits) in g.iter().enumerate() {
+            for col in 0..3 {
+                if *bits & (0b100u8 >> col) != 0 {
+                    let px = gx + col * s;
+                    let py = y0 + row as i32 * s;
+                    rect(&mut v, px, py, px + s, py + s, win_w, win_h);
+                }
+            }
+        }
+    }
+    v
+}
+
+// 像素矩形（左上原点、y 向下）→ NDC 两个三角形
+fn rect(v: &mut Vec<f32>, x0: i32, y0: i32, x1: i32, y1: i32, w: i32, h: i32) {
+    let nx = |x: i32| x as f32 * 2.0 / w as f32 - 1.0;
+    let ny = |y: i32| 1.0 - y as f32 * 2.0 / h as f32;
+    let (l, r, t, b) = (nx(x0), nx(x1), ny(y0), ny(y1));
+    v.extend_from_slice(&[l, t, r, t, l, b, r, t, r, b, l, b]);
 }
 
 impl RenderState {
@@ -884,6 +1045,33 @@ unsafe fn upload_frame(state: &RenderState, cur: usize, frame: &YuvFrame, map_un
     }
 }
 
+// 编译 + 链接一对 GLSL，返回 program。编译/链接失败只记日志（沿用原行为）
+unsafe fn build_program(vs_src: &str, fs_src: &str) -> u32 {
+    unsafe {
+        let vs_src = CString::new(vs_src).unwrap();
+        let fs_src = CString::new(fs_src).unwrap();
+
+        let vs = gl::CreateShader(gl::VERTEX_SHADER);
+        gl::ShaderSource(vs, 1, &vs_src.as_ptr(), std::ptr::null());
+        gl::CompileShader(vs);
+        log_shader_status(vs, "vertex");
+
+        let fs = gl::CreateShader(gl::FRAGMENT_SHADER);
+        gl::ShaderSource(fs, 1, &fs_src.as_ptr(), std::ptr::null());
+        gl::CompileShader(fs);
+        log_shader_status(fs, "fragment");
+
+        let program = gl::CreateProgram();
+        gl::AttachShader(program, vs);
+        gl::AttachShader(program, fs);
+        gl::LinkProgram(program);
+        gl::DeleteShader(vs);
+        gl::DeleteShader(fs);
+        log_program_status(program);
+        program
+    }
+}
+
 // 着色器编译/链接状态校验：失败时输出日志，避免驱动异常时静默黑屏难排查
 unsafe fn log_shader_status(shader: u32, label: &str) {
     unsafe {
@@ -917,4 +1105,33 @@ unsafe fn info_log(mut get: impl FnMut(i32, *mut i32, *mut i8)) -> String {
     let mut written = 0;
     get(buf.len() as i32, &mut written, buf.as_mut_ptr() as *mut i8);
     String::from_utf8_lossy(&buf[..written.max(0) as usize]).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 一个点亮像素 = 一个矩形 = 6 顶点 = 12 个 f32；背景固定 6 顶点。
+    // "1" 的 3×5 点阵亮 8 个点 → 6 + 8×6 = 54 顶点
+    #[test]
+    fn time_verts_count_matches_lit_pixels() {
+        let v = time_verts("1", 100, 100);
+        assert_eq!(v.len(), 54 * 2);
+        // 空格只占位，不产生点阵矩形
+        let space = time_verts(" ", 100, 100);
+        assert_eq!(space.len(), 6 * 2);
+    }
+
+    // 所有顶点必须落在 NDC 内，且背景在文字之后（前 6 顶点为底衬）
+    #[test]
+    fn time_verts_stay_in_ndc_and_put_background_first() {
+        for (w, h) in [(320, 240), (1920, 1080), (3840, 2160), (97, 61)] {
+            let v = time_verts("12:34 / 56:78", w, h);
+            assert!(v.len() > 6 * 2);
+            assert!(v.iter().all(|c| (-1.0..=1.0).contains(c)), "{w}x{h}");
+            // 背景：左上 > 右下（y 轴向上），且比字形区域更靠左上
+            let (l, t, r, b) = (v[0], v[1], v[2], v[5]);
+            assert!(l < r && b < t, "背景矩形方向: {w}x{h}");
+        }
+    }
 }

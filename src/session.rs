@@ -41,7 +41,6 @@ pub struct SessionInputs<'a> {
     pub ytdlp_child: Option<Child>,
     pub watchdog: Option<util::ReadWatchdog>,
     pub info: StreamInfo,
-    pub title: String,
     pub dur: f64,
     pub paused: Arc<PauseGate>,
     pub volume: Arc<AtomicU32>,
@@ -53,7 +52,6 @@ pub struct SessionInputs<'a> {
 
 pub struct SourceSession {
     info: StreamInfo,
-    title: String,
     dur: f64,
     paused: Arc<PauseGate>,
     volume: Arc<AtomicU32>,
@@ -82,6 +80,8 @@ pub struct SourceSession {
     stream_handle: Rc<RefCell<Option<cpal::Stream>>>,
     seek_handle: Rc<RefCell<Option<Arc<SeekCtl>>>>,
     dur_handle: Rc<RefCell<f64>>,
+    // 右上角时间 OSD 文本（窗口标题只留媒体名）
+    overlay_handle: Rc<RefCell<String>>,
 }
 
 // 有界 join：正常情况线程几毫秒内退出；网络读/驱动清理卡住时不能让 UI
@@ -104,7 +104,6 @@ impl SourceSession {
             ytdlp_child,
             watchdog,
             info,
-            title,
             dur,
             paused,
             volume,
@@ -114,7 +113,6 @@ impl SourceSession {
         } = inputs;
         Self {
             info,
-            title,
             dur,
             paused,
             volume,
@@ -138,6 +136,7 @@ impl SourceSession {
             stream_handle: Rc::new(RefCell::new(None)),
             seek_handle: Rc::new(RefCell::new(None)),
             dur_handle: Rc::new(RefCell::new(0.0)),
+            overlay_handle: Rc::new(RefCell::new(String::new())),
         }
     }
 
@@ -149,6 +148,7 @@ impl SourceSession {
         self.stream_handle = state.stream_handle.clone();
         self.seek_handle = state.seek_handle.clone();
         self.dur_handle = state.dur_handle.clone();
+        self.overlay_handle = state.overlay.clone();
     }
 
     // 装配并启动本源的全部线程。音频输出失败会降级为无声/墙钟，不返回 Err。
@@ -353,7 +353,7 @@ impl SourceSession {
         let seek_ctl = self.seek_ctl.as_ref().expect("pump before start");
         let mut finished = false;
         let mut last_exit = PumpExit::Empty;
-        let mut last_title_sec = u64::MAX;
+        let mut last_overlay_sec = u64::MAX;
 
         while !finished && app.wait() {
             let reason = loop {
@@ -366,22 +366,16 @@ impl SourceSession {
                             }
                             continue;
                         }
-                        // 进度显示：标题反映当前位置/总时长
+                        // 时间 OSD：只在整秒变化时重写（标题只保留媒体名）
                         let cur_sec = new_frame.pts_sec;
-                        if cur_sec as u64 != last_title_sec {
-                            last_title_sec = cur_sec as u64;
+                        if cur_sec as u64 != last_overlay_sec {
+                            last_overlay_sec = cur_sec as u64;
                             let dur = *self.dur_handle.borrow();
-                            let label = if dur > 0.0 {
-                                format!(
-                                    "{} [{}/{}]",
-                                    self.title,
-                                    format_time(cur_sec),
-                                    format_time(dur)
-                                )
+                            *self.overlay_handle.borrow_mut() = if dur > 0.0 {
+                                format!("{} / {}", format_time(cur_sec), format_time(dur))
                             } else {
-                                format!("{} [{}]", self.title, format_time(cur_sec))
+                                format_time(cur_sec)
                             };
-                            win.set_label(&label);
                         }
                         if let Some(old_frame) = self.frame_store.borrow_mut().replace(new_frame)
                             && let Some(tx) = self.recycle_handle.borrow().as_ref()
@@ -439,6 +433,7 @@ impl SourceSession {
         *self.stream_handle.borrow_mut() = None;
         *self.seek_handle.borrow_mut() = None;
         *self.dur_handle.borrow_mut() = 0.0;
+        self.overlay_handle.borrow_mut().clear();
         // 先等视频/音频线程把解码器、CUDA 设备等资源释放掉，再让进程退出；
         // 否则 release 下主线程可能先 exit，后台 av_buffer_unref 会踩空。
         join_bounded(self.video_handle.take(), Duration::from_secs(3));

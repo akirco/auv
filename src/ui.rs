@@ -33,6 +33,8 @@ pub struct PlayerState {
     pub mute: Arc<AtomicBool>,
     // DMA-BUF 帧截图：UI 置位，渲染端在下次绘制后读回 back buffer
     pub snapshot_request: Arc<AtomicBool>,
+    // 右上角时间 OSD 文本（"01:23 / 05:00"）；空串表示不画
+    pub overlay: Rc<RefCell<String>>,
 }
 
 impl Default for PlayerState {
@@ -53,6 +55,7 @@ impl PlayerState {
             volume: Arc::new(AtomicU32::new(100)),
             mute: Arc::new(AtomicBool::new(false)),
             snapshot_request: Arc::new(AtomicBool::new(false)),
+            overlay: Rc::new(RefCell::new(String::new())),
         }
     }
 }
@@ -75,10 +78,13 @@ pub fn register_window_callbacks(
     rs: render::RenderState,
 ) {
     let draw_store = state.frame_store.clone();
+    let overlay_draw = state.overlay.clone();
     win.draw(move |w| {
         let frame_guard = draw_store.borrow();
         if let Some(frame) = frame_guard.as_ref() {
             draw_frame(w, &rs, frame);
+            // 时间叠在视频右上角（窗口标题只留媒体名）
+            render::draw_time_overlay(w, &rs, &overlay_draw.borrow());
         }
     });
 
