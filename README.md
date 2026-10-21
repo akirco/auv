@@ -25,6 +25,7 @@ AUV（A/V Sync Engine）是一个使用 Rust 编写的轻量桌面媒体播放�
 - ALSA 开发库
 - `pkgconf`（提供 `pkg-config` 命令）
 - FLTK 构建所需的 C/C++ 编译工具和 CMake
+- OpenGL/GLU/EGL 开发库（`libgl1-mesa-dev`、`libglu1-mesa-dev`、`libegl1-mesa-dev`，FLTK 的 Wayland 后端需要 `glu`）
 - Wayland 开发库（项目启用了 FLTK 的 Wayland 支持）
 
 在 Arch Linux 上可以安装：

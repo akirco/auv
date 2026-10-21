@@ -24,7 +24,8 @@ jobs:
             libasound2-dev libpipewire-0.3-dev \
             libwayland-dev wayland-protocols libxkbcommon-dev \
             libx11-dev libxft-dev libxinerama-dev libxcursor-dev \
-            libxrandr-dev libxi-dev libgl1-mesa-dev
+            libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libglu1-mesa-dev libegl1-mesa-dev
 
       - name: Format
         run: cargo fmt --check
