@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag，例如 v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake clang libclang-dev \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev libavfilter-dev libavdevice-dev \
+            libasound2-dev libpipewire-0.3-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev \
+            libx11-dev libxft-dev libxinerama-dev libxcursor-dev \
+            libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libglu1-mesa-dev libegl1-mesa-dev \
+            libcairo2-dev libpango1.0-dev libdbus-1-dev \
+            patchelf file
+
+      - name: Build release binary
+        # 覆盖 .cargo/config.toml 里的 target-cpu=native，产物才能在其它 CPU 上运行
+        run: cargo build --release --locked --config 'build.rustflags=["-C","target-cpu=x86-64"]'
+
+      - name: Smoke test
+        run: ./target/release/auv --version
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          lean="auv-${version}-linux-x86_64"
+          bundle="${lean}-bundle"
+          rm -rf dist
+          mkdir -p "dist/${lean}" "dist/${bundle}/lib"
+
+          # 精简包：只含二进制，依赖由系统提供
+          cp target/release/auv "dist/${lean}/auv"
+          cp README.md "dist/${lean}/README.md"
+
+          # 自包含包：把除 glibc 外的动态库一起打包，并改写 RPATH
+          cp target/release/auv "dist/${bundle}/auv"
+          cp README.md "dist/${bundle}/README.md"
+          ldd target/release/auv \
+            | awk '/=> \// {print $3} /^\// {print $1}' \
+            | sort -u > /tmp/auv-libs.txt
+          while read -r lib; do
+            [ -n "$lib" ] || continue
+            base="$(basename "$lib")"
+            case "$base" in
+              libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|libresolv.so.*|\
+              libnsl.so.*|libutil.so.*|libanl.so.*|libBrokenLocale.so.*|libgcc_s.so.*|ld-linux*) continue ;;
+            esac
+            cp -L "$lib" "dist/${bundle}/lib/${base}"
+          done < /tmp/auv-libs.txt
+          for so in "dist/${bundle}"/lib/*.so*; do
+            [ -e "$so" ] || continue
+            patchelf --set-rpath '$ORIGIN' "$so"
+          done
+          patchelf --set-rpath '$ORIGIN/lib' "dist/${bundle}/auv"
+
+          tar -czf "dist/${lean}.tar.gz" -C dist "${lean}"
+          tar -czf "dist/${bundle}.tar.gz" -C dist "${bundle}"
+          (cd dist && sha256sum "${lean}.tar.gz" "${bundle}.tar.gz" > SHA256SUMS)
+          ls -lh dist
+
+      - name: Verify bundles
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          lean="auv-${version}-linux-x86_64"
+          bundle="${lean}-bundle"
+          rm -rf /tmp/auv-verify
+          mkdir -p /tmp/auv-verify
+          # 自包含包依靠 RPATH 找到随包动态库，不依赖系统库路径
+          tar -xzf "dist/${bundle}.tar.gz" -C /tmp/auv-verify
+          "/tmp/auv-verify/${bundle}/auv" --version
+          tar -xzf "dist/${lean}.tar.gz" -C /tmp/auv-verify
+          "/tmp/auv-verify/${lean}/auv" --version
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          lean="auv-${version}-linux-x86_64"
+          bundle="${lean}-bundle"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "dist/${lean}.tar.gz" "dist/${bundle}.tar.gz" dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" \
+              "dist/${lean}.tar.gz" "dist/${bundle}.tar.gz" dist/SHA256SUMS \
+              --title "auv ${TAG}" --generate-notes
+          fi
