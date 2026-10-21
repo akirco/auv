@@ -131,9 +131,15 @@ impl SeekCtl {
     /// 主线程请求 seek 到 target_sec（秒）。同一时刻只保留最新目标。
     /// 目标、代数与原子镜像在同一临界区内一起更新：读者要么三者都看不到
     /// （无新 seek），要么看到已配好的新代数与新目标，不会读到中间态。
+    /// 与当前目标完全相同的重复请求直接忽略：按住方向键（key repeat ~30/s）时
+    /// 当前显示帧不变，每次按键算出的目标相同，重复递增代数只会让解码线程反复
+    /// flush/清环/重建重采样器、demux 反复 seek 到同一位置。
     pub fn request(&self, target_sec: f64) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         let mut g = self.state.lock().unwrap();
+        if g.target == Some(target_sec) {
+            return;
+        }
         g.target = Some(target_sec);
         g.epoch += 1;
         // 必须在锁内发布：否则 state 会短暂领先镜像，解码线程从锁内读到的
@@ -603,6 +609,26 @@ mod tests {
         assert_eq!(ctl.epoch(), 2);
         // 已处理到代数 2 后，快路径应报告"无新 seek"
         assert!(ctl.snapshot_new(2).is_none());
+    }
+
+    // 同一目标的重复请求（按住方向键）合并：不递增代数，避免重复
+    // flush/清环/重建重采样器与重复 seek；不同目标仍然各算一次
+    #[test]
+    fn duplicate_requests_do_not_bump_epoch() {
+        let ctl = SeekCtl::new(1);
+        ctl.request(1.0);
+        assert_eq!(ctl.epoch(), 1);
+        assert_eq!(ctl.snapshot_new(0), Some((1, Some(1.0))));
+
+        ctl.request(1.0);
+        ctl.request(1.0);
+        assert_eq!(ctl.epoch(), 1, "同一目标不应递增代数");
+        assert_eq!(ctl.request_count(), 3, "请求计数照常累加");
+
+        // 新目标照常递增，并带上新目标
+        ctl.request(1.5);
+        assert_eq!(ctl.epoch(), 2);
+        assert_eq!(ctl.snapshot_new(1), Some((2, Some(1.5))));
     }
 
     // 原子快路径 + 锁内复核：并发连续 seek 时读到的 (代数, 目标) 必须配对，
