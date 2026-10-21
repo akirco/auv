@@ -2,7 +2,20 @@
 name = "auv"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "AUV is a media player written in Rust.(fltk, cpal, ffmpeg-next)"
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18.2"
+env_logger = "0.11.11"
+ffmpeg-next = "9.0.0"
+fltk = { version = "1.5.23", features = ["enable-glwindow", "use-wayland"] }
+gl = "0.14.0"
+libloading = "0.8"
+log = "0.4.34"
+png = "0.18.1"
+ringbuf = "0.5.3"
 
 [features]
 # 默认用 cpal 原生 PipeWire 后端（Linux 上 cpal::default_host 会优先选它）：
@@ -12,16 +25,9 @@ description = "AUV is a media player written in Rust.(fltk, cpal, ffmpeg-next)"
 default = ["pipewire"]
 pipewire = ["cpal/pipewire"]
 
-[dependencies]
-anyhow = "1.0.104"
-cpal = "0.18.2"
-env_logger = "0.11.11"
-ffmpeg-next = "9.0.0"
-fltk = { version = "1.5.23", features = ["enable-glwindow", "use-wayland"] }
-gl = "0.14.0"
-log = "0.4.34"
-png = "0.18.1"
-ringbuf = "0.5.2"
+[lints.rust]
+# edition 2024 默认已 warn；显式写出来，便于未来升级为 deny
+unsafe_op_in_unsafe_fn = "warn"
 
 [profile.dev]
 # 开发时也让本 crate 的代码有基本优化，否则播放路径（YUV→RGB、重采样）

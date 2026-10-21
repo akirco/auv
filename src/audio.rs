@@ -1,9 +1,7 @@
 use anyhow::Result;
-use cpal::traits::{DeviceTrait, StreamTrait};
-use ffmpeg_next::{
-    channel_layout::ChannelLayout, codec, codec::packet::Packet, software::resampling,
-};
-use log::{error, warn};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ffmpeg_next::{channel_layout::ChannelLayout, codec, software::resampling};
+use log::{error, info, warn};
 use ringbuf::{
     HeapProd, HeapRb,
     traits::{Consumer, Observer, Producer, Split},
@@ -17,14 +15,60 @@ use std::{
     time::Duration,
 };
 
-use crate::source::SourceShared;
+use crate::{
+    demux::{SeekCtl, TimedPacket},
+    source::{SourceShared, SourceStats},
+};
+
+// 音频输出设备与配置：进程内只探测一次，跨源复用。
+// 具体配置策略（F32 / 默认采样率声道 / 放大缓冲粒度）见 prepare_audio_config。
+pub struct AudioOutput {
+    pub device: Option<cpal::Device>,
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub config: Option<cpal::StreamConfig>,
+}
+
+impl AudioOutput {
+    pub fn detect() -> Self {
+        let host = cpal::default_host();
+        info!("Audio host: {}", host.id());
+        let device = host.default_output_device();
+        let (sample_rate, channels, config) = match device.as_ref().and_then(prepare_audio_config) {
+            Some(cfg) => (cfg.sample_rate, cfg.channels as u32, Some(cfg)),
+            None => (0, 0, None),
+        };
+        Self {
+            device,
+            sample_rate,
+            channels,
+            config,
+        }
+    }
+}
+
+// 环形缓冲“有空间”的通知：回调只 notify（不需要拿锁），生产者仅在环满时
+// 带超时等待，避免原来每 1ms 轮询一次。
+pub struct AudioSpace {
+    lock: Mutex<()>,
+    cond: Condvar,
+}
+
+impl AudioSpace {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            lock: Mutex::new(()),
+            cond: Condvar::new(),
+        })
+    }
+}
 
 // 音频解码线程：从 demux 通道收 packet 解码、重采样后喂入环形缓冲。
 // 解码与视频分离，视频同步休眠不会再阻塞音频，避免缓冲下溢产生静音断裂。
 // seek 时：flush 解码器、排空通道、由 cpal 回调清空环缓冲、重建重采样器丢弃
 // 滞留样本、复位采样计数（主时钟基准），然后回报就绪；demux 待所有解码线程
 // 就绪后才移动读位置。播完尾部后驻留响应 seek，直到 demux 通道断开。
-pub fn spawn_audio_thread(ctx: AudioThreadCtx) {
+pub fn spawn_audio_thread(ctx: AudioThreadCtx) -> std::thread::JoinHandle<()> {
     // 退出守卫：无论正常结束、返回 Err 还是 panic 展开，Drop 都会执行：
     //  - 置 audio_done + notify，放行视频线程的 wait_audio_done（否则要干等 5 秒）；
     //  - 非正常收尾时置 audio_dead，让主时钟退回墙钟。否则采样计数不再推进，
@@ -33,28 +77,34 @@ pub fn spawn_audio_thread(ctx: AudioThreadCtx) {
         audio_done: Arc<AtomicBool>,
         audio_dead: Arc<AtomicBool>,
         done_cond: Arc<(Mutex<()>, Condvar)>,
+        ctl: Arc<SeekCtl>,
         normal: bool,
     }
     impl Drop for ExitGuard {
         fn drop(&mut self) {
             if !self.normal {
                 self.audio_dead.store(true, Ordering::Relaxed);
+                // 本线程不会再 report_ready：把它从 seek 屏障移除，否则下一次
+                // seek 时 demux 会永久等待（A3）
+                self.ctl.abandon_decoder();
             }
             self.audio_done.store(true, Ordering::Relaxed);
             self.done_cond.1.notify_all();
         }
     }
 
-    let (audio_done, done_cond, audio_dead) = (
+    let (audio_done, done_cond, audio_dead, ctl) = (
         ctx.shared.audio_done.clone(),
         ctx.shared.done_cond.clone(),
         ctx.shared.audio_dead.clone(),
+        ctx.shared.ctl.clone(),
     );
     std::thread::spawn(move || {
         let mut guard = ExitGuard {
             audio_done,
             audio_dead,
             done_cond,
+            ctl,
             normal: false,
         };
         // 工作线程的错误不会自动上抛，join 句柄又被丢弃：必须在这里就地记录
@@ -64,20 +114,21 @@ pub fn spawn_audio_thread(ctx: AudioThreadCtx) {
             guard.normal = true;
         }
         // guard 在此 Drop：置位、唤醒
-    });
+    })
 }
 
 // 音频线程的完整输入：由主循环一次性打包传入，
 // 避免散参数顺序/个数错误（原为 12 个参数的 spawn）
 pub struct AudioThreadCtx {
-    pub audio_rx: Receiver<Packet>,
+    pub audio_rx: Receiver<TimedPacket>,
     pub audio_parameters: codec::parameters::Parameters,
     pub producer: HeapProd<f32>,
     pub sample_rate: u32,
     pub channels: u32,
     pub shared: Arc<SourceShared>,
     pub samples_played: Arc<AtomicU64>,
-    pub ring_clear: Arc<Mutex<bool>>,
+    pub ring_clear: Arc<AtomicBool>,
+    pub space: Arc<AudioSpace>,
 }
 
 // 音频解码线程的局部状态：原为 thread::spawn 内的一组闭包，
@@ -95,10 +146,11 @@ struct AudioThread {
     src_rate: f64,
     sample_rate: u32,
     producer: HeapProd<f32>,
-    audio_rx: Receiver<Packet>,
+    audio_rx: Receiver<TimedPacket>,
     shared: Arc<SourceShared>,
     samples_played: Arc<AtomicU64>,
-    ring_clear: Arc<Mutex<bool>>,
+    ring_clear: Arc<AtomicBool>,
+    space: Arc<AudioSpace>,
     // 已处理的 seek 代数
     local_epoch: u64,
     // 复用一个重采样输出帧：容量按需增长，避免每个解码帧都分配释放。
@@ -119,6 +171,7 @@ impl AudioThread {
             shared,
             samples_played,
             ring_clear,
+            space,
         } = ctx;
         let decoder = codec::context::Context::from_parameters(audio_parameters)?
             .decoder()
@@ -171,6 +224,7 @@ impl AudioThread {
             shared,
             samples_played,
             ring_clear,
+            space,
             local_epoch: 0,
             resampled: ffmpeg_next::util::frame::Audio::empty(),
             resampled_cap: 0,
@@ -204,9 +258,9 @@ impl AudioThread {
     fn wait_if_paused(&self) -> bool {
         // 先查 seek 再等待：被 seek 打断时立即返回；
         // 轮询式检查也避免 seek 的 notify 恰好发生在进入等待前而丢失
-        self.shared
-            .paused
-            .wait_while_paused(|| self.shared.ctl.epoch() != self.local_epoch)
+        self.shared.paused.wait_while_paused(|| {
+            self.shared.stop.load(Ordering::Relaxed) || self.shared.ctl.epoch() != self.local_epoch
+        })
     }
 
     // resampler.run 只会为输出帧分配和输入等长的缓冲，
@@ -230,6 +284,9 @@ impl AudioThread {
             while offset < samples.len() {
                 let pushed = self.producer.push_slice(&samples[offset..]);
                 if pushed == 0 {
+                    if self.shared.stop.load(Ordering::Relaxed) {
+                        return false; // 本源已收尾：不再等环缓冲排空
+                    }
                     if self.shared.audio_dead.load(Ordering::Relaxed) {
                         return false; // 设备已失效，环缓冲不会再排空，放弃剩余数据
                     }
@@ -240,7 +297,15 @@ impl AudioThread {
                             break;
                         }
                     } else {
-                        std::thread::sleep(Duration::from_millis(1));
+                        // 环满：等回调腾出空间。回调只 notify、不持锁，
+                        // 实时线程不会被这里的互斥锁阻塞；1ms 超时仅作兜底
+                        let guard = self.space.lock.lock().unwrap_or_else(|e| e.into_inner());
+                        if self.producer.occupied_len() >= samples.len() {
+                            let _ = self
+                                .space
+                                .cond
+                                .wait_timeout(guard, Duration::from_millis(1));
+                        }
                     }
                 } else {
                     offset += pushed;
@@ -258,12 +323,18 @@ impl AudioThread {
         // 回调运行正常时 ~10ms 内清空；暂停中回调不运行，则最多等 100ms
         // 后继续——标记保持置位，恢复播放后回调第一次运行仍会清空，
         // 因此旧样本绝不会被播出（新推入的少量样本可能一并被清，属可接受）
-        *self.ring_clear.lock().unwrap() = true;
-        for _ in 0..20 {
-            if !*self.ring_clear.lock().unwrap() || self.shared.audio_dead.load(Ordering::Relaxed) {
-                break;
+        self.ring_clear.store(true, Ordering::Release);
+        // 回调运行正常时 ~10ms 内清空；暂停中回调不运行，直接跳过等待
+        // （恢复后第一次回调仍会看到标记并清空），避免每次暂停 seek 固定等 100ms
+        if !self.shared.paused.is_paused() {
+            for _ in 0..20 {
+                if !self.ring_clear.load(Ordering::Acquire)
+                    || self.shared.audio_dead.load(Ordering::Relaxed)
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
             }
-            std::thread::sleep(Duration::from_millis(5));
         }
         self.samples_played.store(0, Ordering::Relaxed);
         self.resampler = Self::build_resampler(
@@ -284,6 +355,10 @@ impl AudioThread {
         // 复用的解码输出帧（见下方 receive_frame 处注释）
         let mut decoded = ffmpeg_next::util::frame::Audio::empty();
         while !eof && !dead {
+            // 本源收尾：不再解码/等待，直接进入收尾路径
+            if self.shared.stop.load(Ordering::Relaxed) {
+                break;
+            }
             // 先响应 seek（暂停被唤醒后也会回到这里）：
             // 就地复位并回报就绪，demux 才移动读位置并发送新包
             if let Some((e, _t)) = self.shared.ctl.snapshot_new(self.local_epoch) {
@@ -302,8 +377,12 @@ impl AudioThread {
             // 有界超时接收：留出每 10ms 检查一次 seek 的机会，避免 seek 时
             // demux 阻塞在就绪屏障上而本线程阻塞在 recv 造成的死锁
             match self.audio_rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(packet) => {
-                    let _ = self.decoder.send_packet(&packet);
+                Ok(tp) => {
+                    // 与视频同理：丢弃复位后才送达的 seek 前旧包
+                    if tp.epoch != self.local_epoch {
+                        continue;
+                    }
+                    let _ = self.decoder.send_packet(&tp.packet);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -336,9 +415,9 @@ impl AudioThread {
             }
         }
 
-        // 冲刷重采样器内部残留的尾部样本（设备已失效时跳过）
+        // 冲刷重采样器内部残留的尾部样本（设备已失效/本源已收尾时跳过）
         loop {
-            if dead {
+            if dead || self.shared.stop.load(Ordering::Relaxed) {
                 break;
             }
             if self.resampled_cap == 0 {
@@ -359,7 +438,10 @@ impl AudioThread {
         // 等环形缓冲里的音频全部播完再标记结束，让视频线程等音频播完才退出；
         // 设备已失效时环缓冲永远不会排空，直接结束
         loop {
-            if self.producer.occupied_len() == 0 || self.shared.audio_dead.load(Ordering::Relaxed) {
+            if self.producer.occupied_len() == 0
+                || self.shared.audio_dead.load(Ordering::Relaxed)
+                || self.shared.stop.load(Ordering::Relaxed)
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -372,6 +454,9 @@ impl AudioThread {
         // 注意：设备失效（audio_dead）时不能退出——否则 seek 的就绪屏障凑不齐
         // 会卡死 demux，这里继续驻留直至通道断开
         loop {
+            if self.shared.stop.load(Ordering::Relaxed) {
+                break;
+            }
             if let Some((e, _t)) = self.shared.ctl.snapshot_new(self.local_epoch) {
                 self.local_epoch = e;
                 self.handle_seek(e)?;
@@ -387,8 +472,8 @@ impl AudioThread {
     }
 }
 
-// 挑选音频输出配置：把缓冲粒度放大到 2048 帧（≈43ms@48kHz），
-// 给实时 worker 更多容错余量，降低下溢（xrun）触发率。
+// 挑选音频输出配置：优先 1024 帧（≈21ms@48kHz）以降低起播/seek 延迟；
+// 设备拒绝时由 session 依次回退 2048 帧、设备默认缓冲。
 // 采样格式取 F32（与环缓冲样本类型一致）、采样率/声道沿用设备默认。
 // `BufferSize::Fixed` 的含义随后端而变：
 //   - 原生 PipeWire 后端：解释为节点 quantum/latency（node.latency=<n>/<rate>），
@@ -413,10 +498,10 @@ pub fn prepare_audio_config(device: &cpal::Device) -> Option<cpal::StreamConfig>
         .map(|r| r.with_sample_rate(rate))
         .unwrap_or(default);
     let mut cfg = sc.config();
-    // 放大 period：优先 2048 帧，不超过设备支持的周期上限（各有 lower/higher bound）
+    // 优先 1024 帧，不超过设备支持的周期范围（各有 lower/higher bound）
     if let cpal::SupportedBufferSize::Range { min, max } = sc.buffer_size() {
-        let want = 2048u32.clamp(*min, *max);
-        if want != 2048 {
+        let want = 1024u32.clamp(*min, *max);
+        if want != 1024 {
             warn!(
                 "Audio: device period range {}-{} frames, using {}",
                 min, max, want
@@ -436,15 +521,18 @@ pub struct AudioOutParams<'a> {
     pub audio_dead: &'a Arc<AtomicBool>,
     pub volume: &'a Arc<AtomicU32>,
     pub mute: &'a Arc<AtomicBool>,
-    pub ring_clear: &'a Arc<Mutex<bool>>,
+    pub ring_clear: &'a Arc<AtomicBool>,
+    pub stats: &'a Arc<SourceStats>,
 }
 
 // 构建音频输出流并启动播放，返回流句柄与环形缓冲 producer。
 // 回调里弹出样本、按共享音量/静音缩放、不足补静音，并把实际交付样本数计入主时钟。
-// 固定缓冲粒度不被设备接受时返回 Err，由调用方退回设备默认配置重试。
-// （ALSA 后端经 PipeWire-ALSA 插件时：枚举阶段未锁采样率，上报范围 85..=91628833；
-//  建流设定 48kHz 后 period 被固定为 1024，导致 Fixed(2048) 被拒，即由此兜底。）
-pub fn build_output_stream(p: AudioOutParams) -> Result<(cpal::Stream, HeapProd<f32>)> {
+// 固定缓冲粒度不被设备接受时返回 Err，由调用方依次回退 2048 帧/设备默认配置。
+// （ALSA 后端经 PipeWire-ALSA 插件时，枚举阶段未锁采样率，上报范围可能很宽；
+//  建流后 period 才被固定，Fixed(1024/2048) 仍可能被拒，故需要多级兜底。）
+pub fn build_output_stream(
+    p: AudioOutParams,
+) -> Result<(cpal::Stream, HeapProd<f32>, Arc<AudioSpace>)> {
     let AudioOutParams {
         device,
         config,
@@ -453,6 +541,7 @@ pub fn build_output_stream(p: AudioOutParams) -> Result<(cpal::Stream, HeapProd<
         volume,
         mute,
         ring_clear,
+        stats,
     } = p;
     // 无锁环形缓冲容量（毫秒）。取 500ms 而非原先的 2s，主要是为了收尾延迟：
     // 播完后 video.rs::wait_audio_done 要等 occupied_len()==0，即把环里剩下的
@@ -463,21 +552,31 @@ pub fn build_output_stream(p: AudioOutParams) -> Result<(cpal::Stream, HeapProd<
         ((config.sample_rate as u64 * config.channels as u64 * RING_MILLIS) / 1000) as usize;
     let ring_buf = HeapRb::<f32>::new(ring_samples);
     let (producer, mut consumer) = ring_buf.split();
+    let space = AudioSpace::new();
+    let space_cb = space.clone();
     let samples_played_cb = samples_played.clone();
     let audio_dead_cb = audio_dead.clone();
     let volume_cb = volume.clone();
     let mute_cb = mute.clone();
     let ring_clear_cb = ring_clear.clone();
+    let stats_cb = stats.clone();
+    let stats_err = stats.clone();
     let stream = device.build_output_stream(
         *config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             // seek 后清空旧音频：置位由音频线程发起，这里实际清空
-            if *ring_clear_cb.lock().unwrap() {
+            if ring_clear_cb.swap(false, Ordering::AcqRel) {
                 consumer.clear();
-                *ring_clear_cb.lock().unwrap() = false;
+                space_cb.cond.notify_one();
             }
             // 批量弹出音频样本，比逐样本 pop 开销更小
             let filled = consumer.pop_slice(data);
+            if filled > 0 {
+                space_cb.cond.notify_one();
+            }
+            if filled < data.len() {
+                stats_cb.underruns.fetch_add(1, Ordering::Relaxed);
+            }
             // 音量/静音：按共享百分比缩放（静音系数 0）。
             // 系数为 1 时跳过循环，常见路径零开销
             let gain = if mute_cb.load(Ordering::Relaxed) {
@@ -499,6 +598,9 @@ pub fn build_output_stream(p: AudioOutParams) -> Result<(cpal::Stream, HeapProd<
             samples_played_cb.fetch_add(filled as u64, Ordering::Relaxed);
         },
         move |err| {
+            if err.kind() == cpal::ErrorKind::Xrun {
+                stats_err.xruns.fetch_add(1, Ordering::Relaxed);
+            }
             // 可恢复/非致命错误只告警，不置失效标记，否则启动阶段一次欠载
             // （xrun，cpal 会自行 prepare() 恢复）或默认设备切换就会永久静音
             match err.kind() {
@@ -519,5 +621,5 @@ pub fn build_output_stream(p: AudioOutParams) -> Result<(cpal::Stream, HeapProd<
         None,
     )?;
     stream.play()?;
-    Ok((stream, producer))
+    Ok((stream, producer, space))
 }

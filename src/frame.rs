@@ -3,9 +3,11 @@ use ffmpeg_next::util::frame::video::Video;
 use ffmpeg_next::{
     Rational,
     format::Pixel,
-    util::color::{Range, Space},
+    util::color::{Primaries, Range, Space, TransferCharacteristic},
 };
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::dmabuf::{DmaBufFrame, DmaBufLayout};
 
 static FRAME_GEN: AtomicU64 = AtomicU64::new(0);
 
@@ -35,16 +37,30 @@ pub fn linesize(f: &Video, plane: usize) -> i32 {
     f.stride(plane) as i64 as i32
 }
 
+// 色度布局：Planar=Y/U/V 三平面；SemiPlanar=NV12/P010 的 Y + 交错 UV 两平面
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChromaLayout {
+    Planar,
+    SemiPlanar,
+}
+
+// 像素数据的来源：CPU 可读平面（软解/swscale 输出），或 GPU 可直接采样的
+// DMA-BUF（VAAPI 零拷贝）。两者共用同一套色彩/显示元数据与 shader。
+enum FrameBuf {
+    Cpu(Box<Video>),
+    DmaBuf(Box<DmaBufFrame>),
+}
+
 // 视频 YUV 帧：直接持有解码器/缩放器给出的 AVFrame 所有权，零拷贝。
 // 不再自带 Vec 平面——像素已在解码器缓冲里，再拷一份是纯浪费。
 // 帧沿"解码 → 渲染/截图 → 回收"流转，回收后复用同一块缓冲。
 //
 // 不变式（由 video.rs 的构造路径保证）：
-// - buf 恒为 YUV420P、y_stride/uv_stride 恒为正（负 stride 经 swscale 摆正）；
+// - CPU 帧恒为 YUV420P/NV12/P010、stride 恒为正（负 stride 经 swscale 摆正）；
 // - 平面长度 = stride * 行数，行数对色度取 ceil(height/2)。
 pub struct YuvFrame {
-    // 像素平面所有权（渲染只读；渲染完由 UI 侧回收给解码线程复用）
-    buf: Box<Video>,
+    // 像素数据所有权（渲染只读；渲染完由 UI 侧回收给解码线程复用）
+    buf: FrameBuf,
     pub width: i32,
     pub height: i32,
     pub y_stride: i32,
@@ -57,13 +73,20 @@ pub struct YuvFrame {
     // 流的色彩信息（帧级 side data）：渲染/截图据此选择转换矩阵与范围
     pub color_space: Space,
     pub color_range: Range,
+    // 色度布局：Planar（YUV420P/10LE）或 SemiPlanar（NV12/P010LE）
+    pub layout: ChromaLayout,
+    // 每分量位数：8（YUV420P/NV12）或 10（YUV420P10LE/P010LE）
+    pub bit_depth: u8,
+    // HDR 传递函数/色域：渲染端据此在 shader 里做 PQ/HLG → SDR tone map
+    pub transfer: TransferCharacteristic,
+    pub primaries: Primaries,
     // SAR 修正后的显示尺寸（渲染视口、窗口宽高比用）
     pub disp_w: i32,
     pub disp_h: i32,
 }
 
 impl YuvFrame {
-    // 用一个已就绪的 420P 正 stride 帧构造（video.rs 的零拷贝路径）
+    // 用一个已就绪的 420P 正 stride 帧构造（video.rs 的 SDR 零拷贝路径）
     pub fn new_shared(
         buf: Box<Video>,
         pts_sec: f64,
@@ -73,14 +96,109 @@ impl YuvFrame {
         disp_h: i32,
         seek_epoch: u64,
     ) -> Self {
-        debug_assert_eq!(buf.format(), Pixel::YUV420P);
+        Self::new_with_depth(
+            buf,
+            ChromaLayout::Planar,
+            8,
+            pts_sec,
+            color_space,
+            color_range,
+            TransferCharacteristic::Unspecified,
+            Primaries::Unspecified,
+            disp_w,
+            disp_h,
+            seek_epoch,
+        )
+    }
+
+    // HDR（PQ/HLG）帧：8-bit 或 10-bit 420P，带传递函数/色域，渲染端做 tone map
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_hdr(
+        buf: Box<Video>,
+        bit_depth: u8,
+        pts_sec: f64,
+        color_space: Space,
+        color_range: Range,
+        transfer: TransferCharacteristic,
+        primaries: Primaries,
+        disp_w: i32,
+        disp_h: i32,
+        seek_epoch: u64,
+    ) -> Self {
+        Self::new_with_depth(
+            buf,
+            ChromaLayout::Planar,
+            bit_depth,
+            pts_sec,
+            color_space,
+            color_range,
+            transfer,
+            primaries,
+            disp_w,
+            disp_h,
+            seek_epoch,
+        )
+    }
+
+    // 半平面 NV12/P010（硬解下载后的常见格式）：Y 平面 + 交错 UV
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_semi(
+        buf: Box<Video>,
+        bit_depth: u8,
+        pts_sec: f64,
+        color_space: Space,
+        color_range: Range,
+        transfer: TransferCharacteristic,
+        primaries: Primaries,
+        disp_w: i32,
+        disp_h: i32,
+        seek_epoch: u64,
+    ) -> Self {
+        Self::new_with_depth(
+            buf,
+            ChromaLayout::SemiPlanar,
+            bit_depth,
+            pts_sec,
+            color_space,
+            color_range,
+            transfer,
+            primaries,
+            disp_w,
+            disp_h,
+            seek_epoch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_depth(
+        buf: Box<Video>,
+        layout: ChromaLayout,
+        bit_depth: u8,
+        pts_sec: f64,
+        color_space: Space,
+        color_range: Range,
+        transfer: TransferCharacteristic,
+        primaries: Primaries,
+        disp_w: i32,
+        disp_h: i32,
+        seek_epoch: u64,
+    ) -> Self {
+        assert!(bit_depth == 8 || bit_depth == 10, "只支持 8/10bit");
+        let expect = match (layout, bit_depth) {
+            (ChromaLayout::Planar, 8) => Pixel::YUV420P,
+            (ChromaLayout::Planar, 10) => Pixel::YUV420P10LE,
+            (ChromaLayout::SemiPlanar, 8) => Pixel::NV12,
+            (ChromaLayout::SemiPlanar, 10) => Pixel::P010LE,
+            _ => panic!("unsupported bit depth {bit_depth}"),
+        };
+        debug_assert_eq!(buf.format(), expect);
         let y_stride = linesize(&buf, 0);
         let uv_stride = linesize(&buf, 1);
         debug_assert!(y_stride > 0 && uv_stride > 0, "stride 必须为正");
         Self {
             width: buf.width() as i32,
             height: buf.height() as i32,
-            buf,
+            buf: FrameBuf::Cpu(buf),
             y_stride,
             uv_stride,
             pts_sec,
@@ -88,48 +206,173 @@ impl YuvFrame {
             seek_epoch,
             color_space,
             color_range,
+            layout,
+            bit_depth,
+            transfer,
+            primaries,
             disp_w,
             disp_h,
         }
     }
 
-    // Y 平面（含行尾 padding，渲染按 stride 上传）
+    // 硬解零拷贝帧：像素在 DMA-BUF 里，渲染端用 EGL 直接导入；不经过 CPU。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_dmabuf(
+        dma: DmaBufFrame,
+        pts_sec: f64,
+        color_space: Space,
+        color_range: Range,
+        transfer: TransferCharacteristic,
+        primaries: Primaries,
+        disp_w: i32,
+        disp_h: i32,
+        seek_epoch: u64,
+    ) -> Self {
+        let layout = match dma.layout {
+            DmaBufLayout::Planar => ChromaLayout::Planar,
+            DmaBufLayout::SemiPlanar => ChromaLayout::SemiPlanar,
+        };
+        let bit_depth = dma.bit_depth;
+        let (width, height) = (
+            dma.planes[0].map_or(0, |p| p.width),
+            dma.planes[0].map_or(0, |p| p.height),
+        );
+        let y_stride = dma.planes[0].map_or(0, |p| p.pitch) as i32;
+        let uv_stride = dma.planes[1].map_or(0, |p| p.pitch) as i32;
+        Self {
+            buf: FrameBuf::DmaBuf(Box::new(dma)),
+            width,
+            height,
+            y_stride,
+            uv_stride,
+            pts_sec,
+            frame_gen: next_frame_gen(),
+            seek_epoch,
+            color_space,
+            color_range,
+            layout,
+            bit_depth,
+            transfer,
+            primaries,
+            disp_w,
+            disp_h,
+        }
+    }
+
+    // 每采样字节数（10bit 为 2）
+    #[inline]
+    pub fn bytes_per_sample(&self) -> usize {
+        if self.bit_depth == 10 { 2 } else { 1 }
+    }
+
+    // DMA-BUF 帧（硬解零拷贝）；CPU 帧返回 None
+    #[inline]
+    pub fn dmabuf(&self) -> Option<&DmaBufFrame> {
+        match &self.buf {
+            FrameBuf::Cpu(_) => None,
+            FrameBuf::DmaBuf(d) => Some(d),
+        }
+    }
+
+    #[inline]
+    pub fn is_dmabuf(&self) -> bool {
+        matches!(self.buf, FrameBuf::DmaBuf(_))
+    }
+
+    // Y 平面（含行尾 padding，渲染按 stride 上传）。DMA-BUF 帧没有 CPU 平面，
+    // 只能由 EGL 导入路径读取；返回空切片避免误用。
     #[inline]
     pub fn y(&self) -> &[u8] {
-        self.buf.data(0)
+        match &self.buf {
+            FrameBuf::Cpu(b) => b.data(0),
+            FrameBuf::DmaBuf(_) => &[],
+        }
     }
     // U 平面
     #[inline]
     pub fn u(&self) -> &[u8] {
-        self.buf.data(1)
+        match &self.buf {
+            FrameBuf::Cpu(b) => b.data(1),
+            FrameBuf::DmaBuf(_) => &[],
+        }
     }
     // V 平面
     #[inline]
     pub fn v(&self) -> &[u8] {
-        self.buf.data(2)
+        match &self.buf {
+            FrameBuf::Cpu(b) => b.data(2),
+            FrameBuf::DmaBuf(_) => &[],
+        }
     }
 
-    // 拆出底层 AVFrame 供解码线程回收复用（像素缓冲也随之保留）
-    pub fn into_buf(self) -> Box<Video> {
-        self.buf
+    // 交错 UV 平面（NV12/P010）
+    #[inline]
+    pub fn uv(&self) -> &[u8] {
+        match &self.buf {
+            FrameBuf::Cpu(b) => b.data(1),
+            FrameBuf::DmaBuf(_) => &[],
+        }
+    }
+
+    #[inline]
+    pub fn is_semi_planar(&self) -> bool {
+        self.layout == ChromaLayout::SemiPlanar
+    }
+
+    // 拆出底层 AVFrame 供解码线程回收复用（像素缓冲也随之保留）。
+    // DMA-BUF 帧的像素属于硬解 surface，不能当软件目标帧复用，直接 drop。
+    pub fn into_buf(self) -> Option<Box<Video>> {
+        match self.buf {
+            FrameBuf::Cpu(buf) => Some(buf),
+            FrameBuf::DmaBuf(_) => None,
+        }
     }
 
     // 拷出一份与解码器无关的平面快照，供后台线程做截图。
     // 必须在 UI 线程上拷贝：回收后的帧会立刻被解码器重填，
     // 后台线程再读会与解码竞争。拷贝本身只是几次 memcpy（几 MB），
     // 远比在 UI 线程做完整编码可忽略。
-    pub fn snapshot(&self) -> FrameSnapshot {
-        FrameSnapshot {
+    // DMA-BUF 帧没有 CPU 平面，返回 None；调用方改用 GL readback 截图。
+    pub fn snapshot(&self) -> Option<FrameSnapshot> {
+        let FrameBuf::Cpu(_) = &self.buf else {
+            return None;
+        };
+        let (u, v, uv_stride) = if self.is_semi_planar() {
+            // 半平面在 UI 线程拆成 U/V 两份，后台截图代码仍按平面处理
+            let cw = (self.width as usize).div_ceil(2);
+            let ch = (self.height as usize).div_ceil(2);
+            let bps = self.bytes_per_sample();
+            let stride = self.uv_stride as usize;
+            let mut up = vec![0u8; cw * ch * bps];
+            let mut vp = vec![0u8; cw * ch * bps];
+            for row in 0..ch {
+                for x in 0..cw {
+                    let src = row * stride + x * 2 * bps;
+                    let dst = (row * cw + x) * bps;
+                    up[dst..dst + bps].copy_from_slice(&self.uv()[src..src + bps]);
+                    vp[dst..dst + bps].copy_from_slice(&self.uv()[src + bps..src + 2 * bps]);
+                }
+            }
+            (up, vp, (cw * bps) as i32)
+        } else {
+            (self.u().to_vec(), self.v().to_vec(), self.uv_stride)
+        };
+        Some(FrameSnapshot {
             y: self.y().to_vec(),
-            u: self.u().to_vec(),
-            v: self.v().to_vec(),
+            u,
+            v,
             width: self.width,
             height: self.height,
             y_stride: self.y_stride,
-            uv_stride: self.uv_stride,
+            uv_stride,
             color_space: self.color_space,
             color_range: self.color_range,
-        }
+            bit_depth: self.bit_depth,
+            // P010 的 10bit 样本 MSB 对齐（code<<6），截图换算时要先右移
+            p010: self.is_semi_planar() && self.bit_depth == 10,
+            transfer: self.transfer,
+            primaries: self.primaries,
+        })
     }
 }
 
@@ -144,6 +387,11 @@ pub struct FrameSnapshot {
     pub uv_stride: i32,
     pub color_space: Space,
     pub color_range: Range,
+    pub bit_depth: u8,
+    // 10bit 样本是否为 P010 的 MSB 对齐（否则按低 10 位处理）
+    pub p010: bool,
+    pub transfer: TransferCharacteristic,
+    pub primaries: Primaries,
 }
 
 pub enum Message {
@@ -250,6 +498,67 @@ mod tests {
         assert_eq!(sar_corrected(640, 480, Rational::new(1, 0)), (640, 480));
     }
 
+    // 10bit（YUV420P10LE）平面长度按字节算，且 snapshot 记录位深/Space 元数据
+    #[test]
+    fn ten_bit_plane_lengths_and_metadata() {
+        let w = 64u32;
+        let h = 33u32;
+        let mut f = ffmpeg_next::util::frame::video::Video::empty();
+        unsafe { f.alloc(Pixel::YUV420P10LE, w, h) };
+        let frame = YuvFrame::new_hdr(
+            Box::new(f),
+            10,
+            0.0,
+            Space::BT2020NCL,
+            Range::MPEG,
+            TransferCharacteristic::SMPTE2084,
+            Primaries::BT2020,
+            w as i32,
+            h as i32,
+            0,
+        );
+        assert_eq!(frame.bytes_per_sample(), 2);
+        let uv_rows = (h as usize).div_ceil(2);
+        assert_eq!(frame.y().len(), frame.y_stride as usize * h as usize);
+        assert_eq!(frame.u().len(), frame.uv_stride as usize * uv_rows);
+        assert_eq!(frame.v().len(), frame.uv_stride as usize * uv_rows);
+        let snap = frame.snapshot().unwrap();
+        assert_eq!(snap.bit_depth, 10);
+        assert_eq!(snap.transfer, TransferCharacteristic::SMPTE2084);
+        assert_eq!(snap.primaries, Primaries::BT2020);
+    }
+
+    // NV12/P010 半平面：UV 交织，snapshot 必须拆成独立 U/V 平面
+    #[test]
+    fn semi_planar_snapshot_splits_uv() {
+        for (pix, depth, bps) in [(Pixel::NV12, 8u8, 1usize), (Pixel::P010LE, 10, 2)] {
+            let (w, h) = (8u32, 4u32);
+            let mut f = ffmpeg_next::util::frame::video::Video::empty();
+            unsafe { f.alloc(pix, w, h) };
+            let frame = YuvFrame::new_semi(
+                Box::new(f),
+                depth,
+                0.0,
+                Space::BT709,
+                Range::MPEG,
+                TransferCharacteristic::Unspecified,
+                Primaries::Unspecified,
+                w as i32,
+                h as i32,
+                0,
+            );
+            assert!(frame.is_semi_planar());
+            assert_eq!(frame.bytes_per_sample(), bps);
+            let uv_rows = (h as usize).div_ceil(2);
+            assert_eq!(frame.uv().len(), frame.uv_stride as usize * uv_rows);
+            let snap = frame.snapshot().unwrap();
+            assert_eq!(snap.bit_depth, depth);
+            // 拆分后每像素 bps 字节，stride = cw*bps
+            assert_eq!(snap.u.len(), (w as usize / 2) * bps * uv_rows);
+            assert_eq!(snap.v.len(), snap.u.len());
+        }
+    }
+
     // snapshot 必须是深拷贝：与底层帧解耦（后台线程据此安全读取）
     #[test]
     fn snapshot_is_independent_copy() {
@@ -262,7 +571,7 @@ mod tests {
             4,
             0,
         );
-        let snap = f.snapshot();
+        let snap = f.snapshot().unwrap();
         assert_eq!(snap.y, f.y());
         assert_eq!(snap.u, f.u());
         assert_eq!(snap.v, f.v());

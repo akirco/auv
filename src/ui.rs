@@ -31,6 +31,14 @@ pub struct PlayerState {
     pub paused: Arc<PauseGate>,
     pub volume: Arc<AtomicU32>,
     pub mute: Arc<AtomicBool>,
+    // DMA-BUF 帧截图：UI 置位，渲染端在下次绘制后读回 back buffer
+    pub snapshot_request: Arc<AtomicBool>,
+}
+
+impl Default for PlayerState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PlayerState {
@@ -44,17 +52,18 @@ impl PlayerState {
             paused: Arc::new(PauseGate::new()),
             volume: Arc::new(AtomicU32::new(100)),
             mute: Arc::new(AtomicBool::new(false)),
+            snapshot_request: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 // 初始化 GL 上下文并构建渲染状态（首个源显示窗口后调用一次）
-pub fn setup_gl(win: &mut GlWindow) -> render::RenderState {
+pub fn setup_gl(win: &mut GlWindow, snap_request: Arc<AtomicBool>) -> render::RenderState {
     win.make_current();
     // 呈现节奏锁定显示器刷新率，避免无谓的满速 present 抢占 GPU
     win.set_swap_interval(1);
     gl::load_with(|s| win.get_proc_address(s) as *const _);
-    unsafe { render::setup_opengl() }
+    unsafe { render::setup_opengl(snap_request) }
 }
 
 // 注册绘制与按键回调（窗口首次显示时调用一次）。
@@ -81,6 +90,7 @@ pub fn register_window_callbacks(
     let dur_keys = state.dur_handle.clone();
     let volume_keys = state.volume.clone();
     let mute_keys = state.mute.clone();
+    let snap_request_keys = state.snapshot_request.clone();
     win.handle(move |w, ev| {
         if ev == fltk::enums::Event::Close {
             app_close.quit();
@@ -112,11 +122,20 @@ pub fn register_window_callbacks(
             {
                 // 把当前显示的帧交给后台线程转 RGB 并编码 PNG：
                 // 转换与压缩是 O(像素数) 的 CPU 工作，在 UI 线程做会冻结窗口。
-                // 快照（几次 memcpy）延迟到 spawn_save 确认没有任务在跑后才取，
-                // 避免连按 S 时白做整帧拷贝；它仍在 UI 线程完成，因为回收后的
-                // 帧会立刻被解码器重填，后台线程直接读会与解码竞争
+                // DMA-BUF 零拷贝帧没有 CPU 平面，改为请求渲染端用 glReadPixels
+                // 在下次绘制后读回视频区域；CPU 帧仍走原来的全分辨率快照。
                 if let Some(frame) = frame_store_keys.borrow().as_ref() {
-                    crate::screenshot::spawn_save(|| frame.snapshot());
+                    if frame.is_dmabuf() {
+                        if crate::screenshot::busy() {
+                            info!("Screenshot still in progress, ignoring request");
+                        } else {
+                            snap_request_keys.store(true, Ordering::Relaxed);
+                            w.redraw();
+                            info!("Screenshot: capturing DMA-BUF frame via GL readback");
+                        }
+                    } else {
+                        crate::screenshot::spawn_save(|| frame.snapshot());
+                    }
                 }
             } else if key == fltk::enums::Key::Left
                 || key == fltk::enums::Key::Right
@@ -161,18 +180,17 @@ pub fn register_window_callbacks(
             } else if key == fltk::enums::Key::from_char('+')
                 || key == fltk::enums::Key::from_char('=')
             {
-                // 音量 +10%（上限 200%）
-                let _ = volume_keys.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some((v + 10).min(200))
-                });
+                // 音量 +10%（上限 200%）。只有 UI 线程会写 volume，直接
+                // load/store 即可；不用 RMW，避开 MSRV 与 fetch_update 弃用问题。
+                let v = volume_keys.load(Ordering::Relaxed);
+                volume_keys.store((v + 10).min(200), Ordering::Relaxed);
                 info!("Volume: {}%", volume_keys.load(Ordering::Relaxed));
             } else if key == fltk::enums::Key::from_char('-')
                 || key == fltk::enums::Key::from_char('_')
             {
                 // 音量 -10%（下限 0%）
-                let _ = volume_keys.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(10))
-                });
+                let v = volume_keys.load(Ordering::Relaxed);
+                volume_keys.store(v.saturating_sub(10), Ordering::Relaxed);
                 info!("Volume: {}%", volume_keys.load(Ordering::Relaxed));
             } else if key == fltk::enums::Key::from_char('m')
                 || key == fltk::enums::Key::from_char('M')

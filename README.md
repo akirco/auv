@@ -141,20 +141,45 @@ HDR10（PQ/BT.2020）源时若不处理，10bit→8bit 转换不会做 PQ→SDR 
 当成 SDR 解码，颜色与对比度会明显不对。YouTube/B 站的 HDR 视频一般同时提供
 SDR 版本，优先 SDR 可保住 4K 且颜色正确（原生 SDR 通常也比 tone map 更准）。
 
-若某个视频**只有 HDR 版本**，AUV 会自动用 FFmpeg 的 `zscale` + `tonemap`
-把它 tone map 成 SDR BT.709 再渲染（支持 PQ/HDR10 与 HLG），颜色正确，
-但比直接播 SDR 更吃 CPU。需要 FFmpeg 带 `zscale`（libzimg）与 `tonemap`
-滤镜；缺失时会退回普通转换并打印告警。
+B 站默认常选 **AV1**。老 Intel 核显（Gen9 及更早，如 UHD 620）没有 AV1
+硬解，VAAPI 解码器会打开但首帧退回软解，日志显示
+`hardware decode unavailable for this stream`，此时 `dmabuf=0`（没有零拷贝）。
+可以用 `AUV_YTDLP_SORT` 覆盖默认排序，优先硬解友好的 HEVC/H.264：
+
+```bash
+AUV_YTDLP_SORT='hdr:SDR,codec:hevc,h264' auv 'https://www.bilibili.com/video/BV...'
+```
+
+支持 AV1 硬解的新显卡可以保持默认，或改成 `'hdr:SDR,codec:av1'`。
+
+若某个视频**只有 HDR 版本**，AUV 会把 10bit 帧（YUV420P10LE）直接上传为
+`GL_R16` 纹理，在片元着色器里完成 PQ/HDR10 或 HLG → 线性光 → BT.2020→BT.709
+→ Hable tone map → gamma 的转换，CPU 不再跑 `zscale`/`tonemap` 滤镜图。
+非 10bit 或 GPU 路径无法处理时会退回原来的 CPU `zscale` + `tonemap`（需要
+FFmpeg 带 `zscale`/`tonemap`，缺失时退回普通转换并告警）。
+
+调试/兜底可用 `AUV_CPU_TONEMAP=1` 强制走 CPU tone map；截图也使用同一套
+CPU 公式，HDR 截图与画面观感一致（HLG 的 OOTF 使用了近似）。
 
 因此网页链接播放依赖 `yt-dlp` 对对应站点的支持。需要登录、Cookie 或浏览器鉴权时，请在 `~/.config/yt-dlp/config` 中配置 `yt-dlp` 选项，例如 `--cookies` 或 `--cookies-from-browser`。
 
 ## 注意事项
 
 - 项目当前要求输入源包含视频流；只有音频的文件会被跳过。
-- 播放 HDR 源时，若为 PQ/HDR10 或 HLG，会自动 tone map 成 SDR BT.709；无论来自网页链接还是直链均生效。
+- 播放 HDR 源时，若为 PQ/HDR10 或 HLG，会优先在 GPU shader 里 tone map 成 SDR BT.709；设置 `AUV_CPU_TONEMAP=1` 可强制走 CPU 滤镜图。
 - 音频默认重采样为立体声浮点格式，并输出到系统默认音频设备。
 - 播放多个源时，窗口会根据当前媒体的分辨率重新调整大小。
 - 网络流的可播放性和稳定性取决于 FFmpeg、网络环境以及 `yt-dlp` 对目标站点的支持。
 - 打开媒体源有 20 秒超时（FFmpeg 的打开与探测是阻塞 I/O，网络不通时若无超时会一直挂死）。超时后该源被跳过，播放列表继续。
 - 音频输出缓冲按设备支持范围放大到 2048 帧（≈43ms@48kHz），以减少偶发的 ALSA 下溢（`Audio Stream Error: ...I/O error`）；设备不支持时自动退而取上限或回退默认配置。音频输出仍偶发失效时，按设计降级为无声并用系统时钟同步，播放不中断。
 
+
+## 开发与测试
+
+```bash
+cargo +nightly fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+```
+
+`src/lib.rs` 暴露了 `cli/clock/frame/demux/pause` 等无 UI 依赖的模块，集成测试在 `tests/`；CI 配置见 `.github/workflows/ci.yml`（Ubuntu + FFmpeg/ALSA/PipeWire/Wayland 依赖）。

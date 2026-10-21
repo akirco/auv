@@ -1,22 +1,8 @@
-mod audio;
-mod cli;
-mod clock;
-mod demux;
-mod frame;
-mod pause;
-mod player;
-mod render;
-mod screenshot;
-mod source;
-mod ui;
-mod util;
-mod video;
-
 use anyhow::Result;
 use fltk::{app, prelude::*, window::GlWindow};
 
-use cli::{CliAction, USAGE, parse_cli};
-use player::{AudioOutput, Player};
+use auv::cli::{CliAction, USAGE, parse_cli};
+use auv::player::{AudioOutput, Player};
 
 fn main() -> Result<()> {
     // 日志分级（RUST_LOG 控制）：默认 info；worker 线程与主循环共用同一 logger
@@ -66,10 +52,16 @@ fn main() -> Result<()> {
     // 预创建窗口（尺寸在首个成功打开的源处确定后再调整并显示）
     let mut win = GlWindow::new(0, 0, 640, 480, "");
     win.set_mode(fltk::enums::Mode::Opengl3);
+    // Wayland app_id / X11 class：Hyprland 等合成器可用它给视频窗口下
+    // noblur/norounding/opaque 规则，减少合成开销
+    win.set_xclass("auv");
     win.end();
 
     // 播放器负责后续所有源的打开、线程装配与 UI 消息泵
-    let mut player = Player::new(win, app, screen, AudioOutput::detect());
+    log::debug!("detecting audio output");
+    let audio = AudioOutput::detect();
+    log::debug!("audio output ready");
+    let mut player = Player::new(win, app, screen, audio);
     for source in &sources {
         // play 返回 false 表示用户关闭了窗口，终止播放列表
         if !player.play(source) {

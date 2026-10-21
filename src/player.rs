@@ -1,54 +1,34 @@
-// 源的播放编排：把「一个媒体源从打开到收尾」的全部逻辑集中在这里。
-// 包括：打开输入与探测流信息、确定/调整窗口、建主时钟与音频输出流、
-// 启动 demux/audio/video 三个解码线程、驱动 UI 消息泵、收尾。
-// main 只负责启动装配与播放列表控制，不理解单个源的内部结构。
+// 播放列表编排：打开媒体源、确定窗口、把单个源的运行期交给 session。
+// 单个源的主时钟、音频输出、三个解码线程、消息泵与收尾都在 session.rs，
+// 这里只保留打开/窗口/播放列表与关闭状态。
 use anyhow::Result;
-use cpal::traits::HostTrait;
-use fltk::{app, prelude::*, window::GlWindow};
-use log::{error, info, warn};
-use std::sync::{
-    Arc, Condvar, Mutex,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
+use fltk::{
+    app,
+    enums::Event,
+    prelude::*,
+    window::{GlWindow, Window},
 };
+use log::warn;
+use std::sync::mpsc;
 
 use crate::{
-    audio,
-    clock::MasterClock,
-    demux::{self, SeekCtl, StreamInfo, extract_streams},
-    frame::{Message, YuvFrame},
-    source::SourceShared,
-    ui::{self, PlayerState, calc_display_size, format_time},
-    util, video,
+    demux::extract_streams,
+    session::{SessionInputs, SourceSession},
+    ui::{self, PlayerState, calc_display_size},
+    util,
 };
 
-// 音频输出设备与配置：进程内只探测一次，跨源复用。
-// 具体配置策略（F32 / 默认采样率声道 / 放大缓冲粒度）见 audio.rs。
-pub struct AudioOutput {
-    device: Option<cpal::Device>,
-    sample_rate: u32,
-    channels: u32,
-    config: Option<cpal::StreamConfig>,
+pub use crate::audio::AudioOutput;
+
+// 打开一个源的结果：成功 / 失败（跳到下一个源）/ 用户关闭窗口
+enum OpenOutcome {
+    Opened(util::OpenedInput),
+    Failed,
+    Closed,
 }
 
-impl AudioOutput {
-    pub fn detect() -> Self {
-        let host = cpal::default_host();
-        info!("Audio host: {}", host.id());
-        let device = host.default_output_device();
-        let (sample_rate, channels, config) =
-            match device.as_ref().and_then(audio::prepare_audio_config) {
-                Some(cfg) => (cfg.sample_rate, cfg.channels as u32, Some(cfg)),
-                None => (0, 0, None),
-            };
-        Self {
-            device,
-            sample_rate,
-            channels,
-            config,
-        }
-    }
-}
+// 后台打开线程通过通道返回的结果；错误转成字符串以便跨线程传递
+type OpenResult = std::result::Result<util::OpenedInput, String>;
 
 // 播放器：持有窗口、跨源共享状态与音频配置，逐个源推进播放列表。
 pub struct Player {
@@ -59,7 +39,12 @@ pub struct Player {
     screen: (f64, f64),
     audio: AudioOutput,
     gl_ready: bool,
+    // 首个源打开期间的纯色占位窗口。不能复用 GlWindow：Wayland 下先 show
+    // 640×480 再 resize 到视频尺寸不会提交新的 xdg_toplevel 尺寸
+    splash: Option<Window>,
     played_any: bool,
+    // 用户在打开/播放期间关闭了窗口：finish() 不应再报"没有可播放的源"
+    closed: bool,
 }
 
 impl Player {
@@ -71,314 +56,196 @@ impl Player {
             screen,
             audio,
             gl_ready: false,
+            splash: None,
             played_any: false,
+            closed: false,
+        }
+    }
+
+    // 显示/更新"正在打开"状态：
+    // - 首个源用独立的纯色 splash 窗口，避免 GlWindow 先以 640×480 显示、
+    //   之后再 resize（Wayland/libdecor 下后者常常不生效）；
+    // - 后续源直接改已经存在的 GlWindow 标题。
+    fn show_loading(&mut self, source: &str) {
+        // 打开期间不应还能对上一个源 seek：先摘掉旧的协调器
+        *self.state.seek_handle.borrow_mut() = None;
+        let title = format!("AUV (A/V Sync Engine) - Loading {}", source);
+        if self.gl_ready {
+            self.win.set_label(&title);
+            self.win.redraw();
+            return;
+        }
+        if let Some(s) = self.splash.as_mut() {
+            s.set_label(&title);
+            s.redraw();
+            return;
+        }
+        let (w, h) = (640, 480);
+        let win_x = ((self.screen.0 as i32 - w) / 2).max(0);
+        let win_y = ((self.screen.1 as i32 - h) / 2 - 20).max(0);
+        let mut splash = Window::new(win_x, win_y, w, h, title.as_str());
+        splash.set_xclass("auv");
+        splash.end();
+        splash.handle(move |_, ev| {
+            if ev == Event::Close {
+                app::quit();
+                true
+            } else {
+                false
+            }
+        });
+        splash.show();
+        self.splash = Some(splash);
+    }
+
+    // 关掉打开阶段的 splash，随后 GlWindow 会以真实视频尺寸首次 show()
+    fn close_splash(&mut self) {
+        if let Some(mut s) = self.splash.take() {
+            s.hide();
+            WidgetBase::delete(s);
+        }
+    }
+
+    // 在后台线程打开输入，期间泵 UI 事件。打开/探测是阻塞 I/O（超时 20s），
+    // 同步做会让窗口在首个源失败时根本不出现、后续源也无法关闭
+    fn open_interactive(&mut self, source: &str) -> OpenOutcome {
+        let (tx, rx) = mpsc::channel::<OpenResult>();
+        let src = source.to_string();
+        std::thread::spawn(move || {
+            let res = util::open_input(&src).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+            app::awake(); // 唤醒可能正阻塞在 app.wait() 的 UI 线程
+        });
+        loop {
+            match rx.try_recv() {
+                Ok(Ok(opened)) => return OpenOutcome::Opened(opened),
+                Ok(Err(e)) => {
+                    warn!("Skipping {}: {}", source, e);
+                    return OpenOutcome::Failed;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    warn!("Opening {} ended unexpectedly", source);
+                    return OpenOutcome::Failed;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if !self.app.wait() {
+                        self.closed = true;
+                        return OpenOutcome::Closed;
+                    }
+                }
+            }
         }
     }
 
     // 播放一个源；返回 false 表示窗口已被关闭、播放列表应终止。
     // 打不开或没有视频流的源会记警告后跳过，返回 true 继续下一个。
     pub fn play(&mut self, source: &str) -> bool {
-        // 每个源独立打开一次 ictx（demux 线程会整体消费它）；
-        // 页面链接（B 站等）经 yt-dlp 桥接时需持有子进程直到本源播完
-        let (ictx, mut ytdlp_child) = match util::open_input(source) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Skipping {}: {}", source, e);
-                return true;
-            }
+        // 先把窗口显示出来（首个源用默认尺寸），再异步打开：
+        // 打开/探测是阻塞 I/O，最长可能 20s，期间仍要能重绘与响应关闭
+        self.show_loading(source);
+        let util::OpenedInput {
+            ictx,
+            mut child,
+            watchdog,
+        } = match self.open_interactive(source) {
+            OpenOutcome::Opened(opened) => opened,
+            OpenOutcome::Failed => return true,
+            OpenOutcome::Closed => return false,
         };
-        let StreamInfo {
-            video_index,
-            audio_index,
-            video_params,
-            audio_params,
-            video_time_base,
-            disp_w,
-            disp_h,
-        } = match extract_streams(&ictx) {
+        let info = match extract_streams(&ictx) {
             Ok(info) => info,
             Err(e) => {
+                // 页面链接经 yt-dlp 打开但拿不到视频流时，必须回收子进程，
+                // 否则会留下僵尸/继续下载的 yt-dlp
+                util::reap_child(&mut child);
                 warn!("Skipping {}: {}", source, e);
                 return true;
             }
         };
-        let (disp_w, disp_h) = (disp_w.max(1), disp_h.max(1));
-        let win_size = calc_display_size(disp_w, disp_h);
+        let win_size = calc_display_size(info.disp_w.max(1), info.disp_h.max(1));
+        log::debug!(
+            "source display={}x{} window={:?} screen={:?}",
+            info.disp_w,
+            info.disp_h,
+            win_size,
+            self.screen
+        );
         let title_base = format!("AUV (A/V Sync Engine) - {}", source);
-
+        // 关掉 splash 后再首次 show GlWindow：此时窗口还没 map，resize 会
+        // 直接成为初始尺寸，不依赖 Wayland 的二次 configure
+        self.close_splash();
         self.show_or_resize(win_size, &title_base);
 
-        // 本源的共享句柄：与窗口回调共用同一份 Arc（来自 PlayerState）
-        let paused = self.state.paused.clone();
-        let dur_handle = self.state.dur_handle.clone();
-        let volume = self.state.volume.clone();
-        let mute = self.state.mute.clone();
-
-        // 该源的主时钟（每个源独立计时，从 0 开始）。
-        // has_audio 必须同时满足「有可用音频输出」与「本源确实有音频轨」：
-        // 纯视频源若被当成有音频，采样计数永不推进，主时钟停在 0，视频会卡死首帧。
-        // audio_dead：音频输出失效标记，出错时置 1，主时钟回退墙钟、
-        // 音频线程中止，避免设备挂掉后播放永久卡死；每源独立避免旧流污染新源
-        let audio_dead = Arc::new(AtomicBool::new(false));
-        let has_audio = self.audio.config.is_some() && audio_index.is_some();
-        let (master_clock, samples_played_arc) = MasterClock::new(
-            self.audio.sample_rate,
-            self.audio.channels,
-            has_audio,
-            audio_dead.clone(),
-        );
-
-        // 环形缓冲清空标记：seek 时由音频线程置位，cpal 回调下次运行时清空环缓冲
-        // （Producer 端没有 clear，清空只能由持有 consumer 的回调完成）
-        let ring_clear = Arc::new(Mutex::new(false));
-
-        // 该源的音频输出流与环形缓冲（纯视频源不建流，避免白占一个设备节点）
-        let (audio_stream_opt, mut audio_producer) = if let (Some(device), Some(config)) =
-            (self.audio.device.as_ref(), self.audio.config.as_ref())
-            && audio_index.is_some()
-        {
-            let build = |cfg: &cpal::StreamConfig| {
-                audio::build_output_stream(audio::AudioOutParams {
-                    device,
-                    config: cfg,
-                    samples_played: &samples_played_arc,
-                    audio_dead: &audio_dead,
-                    volume: &volume,
-                    mute: &mute,
-                    ring_clear: &ring_clear,
-                })
-            };
-            // 首选放大后的固定缓冲粒度；设备声明的范围可能失真（如 ALSA 经
-            // PipeWire 插件时在设定采样率后才把 period 固定为 1024），建流失败
-            // 时退回设备默认配置重试。仍失败则按无音频路径走（producer 一并丢弃），
-            // 否则环形缓冲永不排空会让视频线程死等
-            match build(config).or_else(|e| {
-                warn!(
-                    "Audio: fixed period rejected ({}), retrying with device default buffer",
-                    e
-                );
-                let fallback = cpal::StreamConfig {
-                    buffer_size: cpal::BufferSize::Default,
-                    ..*config
-                };
-                build(&fallback)
-            }) {
-                Ok((stream, producer)) => (Some(stream), Some(producer)),
-                Err(e) => {
-                    // 建流彻底失败：置失效标记让主时钟退回墙钟，否则采样计数
-                    // 永不推进，视频会卡死首帧
-                    audio_dead.store(true, Ordering::Relaxed);
-                    error!("Audio output init failed: {}", e);
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
-        *self.state.stream_handle.borrow_mut() = audio_stream_opt;
-
-        // 本源的 seek 协调器：就绪屏障需要视频线程（恒为 1）与音频线程（按需 +1）。
-        // 必须在本源线程启动前建好，各线程共享同一份
-        let has_audio_thread =
-            audio_producer.is_some() && audio_index.is_some() && audio_params.is_some();
-        let seek_ctl = Arc::new(SeekCtl::new(1 + usize::from(has_audio_thread)));
-        *self.state.seek_handle.borrow_mut() = Some(seek_ctl.clone());
-        // 记录总时长（微秒 → 秒）供进度显示与 seek 钳制；未知（0/负）按 0 处理
         let dur_us = ictx.duration();
-        *self.state.dur_handle.borrow_mut() = if dur_us > 0 {
+        let dur = if dur_us > 0 {
             dur_us as f64 / 1_000_000.0
         } else {
             0.0
         };
-
-        // 换源时复位暂停状态
-        paused.reset();
-
-        // 本源的通道与线程。
-        // 有界 sync_channel：UI 线程卡顿（如合成器阻塞 swap）时视频线程在 send
-        // 上被背压阻塞，杜绝帧在无界队列里以每帧数 MB 的速度无限堆积；
-        // 发送后用 app::awake() 手动唤醒事件循环（见 video.rs）。
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Message>(2);
-        let (recycle_tx, recycle_rx) = mpsc::channel::<YuvFrame>();
-        *self.state.recycle_handle.borrow_mut() = Some(recycle_tx);
-
-        // 有界通道：demux 线程分发包给两个解码线程；容量即预缓冲深度，
-        // 消费跟不上时 demux 阻塞，自动把网络下载节流到播放速度。
-        let (video_tx, video_rx) = mpsc::sync_channel::<ffmpeg_next::codec::packet::Packet>(100);
-        let (audio_tx, audio_rx) = mpsc::sync_channel::<ffmpeg_next::codec::packet::Packet>(200);
-
-        // 解复用线程：统一读取媒体 packet 并分发
-        demux::spawn_demux_thread(
+        let mut session = SourceSession::new(SessionInputs {
             ictx,
-            video_index,
-            audio_index,
-            video_tx,
-            audio_tx,
-            seek_ctl.clone(),
-        );
-
-        // 音频是否已全部播完（含环形缓冲排空）。视频线程据此决定何时结束播放，
-        // 避免视频先播完就把还没播出的音频尾部截断。
-        let audio_done = Arc::new(AtomicBool::new(false));
-        // 视频线程在"等音频播完"时阻塞于此，由音频线程播完时唤醒，避免忙轮询
-        let sync = Arc::new((Mutex::new(()), Condvar::new()));
-
-        // 无音频输出或无音频流时，直接标记音频完成
-        if audio_producer.is_none() || audio_index.is_none() {
-            audio_done.store(true, Ordering::Relaxed);
-            sync.1.notify_all();
-        }
-
-        // 本源各线程共享的句柄（暂停门 / seek 协调器 / 音频结束与失效标记）
-        let shared = Arc::new(SourceShared::new(
-            paused.clone(),
-            audio_done.clone(),
-            audio_dead.clone(),
-            sync.clone(),
-            seek_ctl.clone(),
-        ));
-
-        // 音频解码线程：从 demux 通道收 packet 解码、重采样后喂入环形缓冲
-        if let (Some(producer), Some(audio_parameters)) = (audio_producer.take(), audio_params)
-            && audio_index.is_some()
-        {
-            audio::spawn_audio_thread(audio::AudioThreadCtx {
-                audio_rx,
-                audio_parameters,
-                producer,
-                sample_rate: self.audio.sample_rate,
-                channels: self.audio.channels,
-                shared: shared.clone(),
-                samples_played: samples_played_arc.clone(),
-                ring_clear: ring_clear.clone(),
-            });
-        }
-
-        // 视频解码与同步线程
-        video::spawn_video_thread(video::VideoThreadCtx {
-            tx,
-            recycle_rx,
-            clock: master_clock,
-            shared: shared.clone(),
-            video_rx,
-            video_parameters: video_params,
-            video_time_base,
+            ytdlp_child: child,
+            watchdog,
+            info,
+            title: title_base,
+            dur,
+            paused: self.state.paused.clone(),
+            volume: self.state.volume.clone(),
+            mute: self.state.mute.clone(),
+            audio: &self.audio,
         });
-
+        session.start(&self.state);
         self.played_any = true;
-
-        // 收到 End 结束本源，继续下一个源
-        let mut finished = false;
-        // 上次写进窗口标题的整秒进度：只有整秒变化才重设标题，避免每帧刷新
-        let mut last_title_sec = u64::MAX;
-
-        // 消息泵退出的三种原因
-        enum PumpExit {
-            Empty,        // 队列已空，回到事件循环等待
-            End,          // 正常播完
-            Disconnected, // 所有 sender 已释放（视频线程 panic/异常退出）
-        }
-
-        while self.app.wait() && !finished {
-            let reason = loop {
-                match rx.try_recv() {
-                    Ok(msg) => match msg {
-                        Message::Frame(new_frame) => {
-                            // 丢弃 seek 之前的残留帧：用户按下 seek 到新位置后，
-                            // 通道里可能还压着 1~2 帧旧位置的画面，直接显示会
-                            // 闪一下旧画面再跳到新位置。seek 不改变 local_epoch，
-                            // 所以按代数比较即可，无需额外的清通道逻辑
-                            if new_frame.seek_epoch != seek_ctl.epoch() {
-                                // 顺带把它还给解码线程复用（帧仍持有像素缓冲）
-                                if let Some(tx) = self.state.recycle_handle.borrow().as_ref() {
-                                    let _ = tx.send(new_frame);
-                                }
-                                continue;
-                            }
-                            // 进度显示：窗口标题反映当前播放位置/总时长
-                            let cur_sec = new_frame.pts_sec;
-                            if cur_sec as u64 != last_title_sec {
-                                last_title_sec = cur_sec as u64;
-                                let dur = *dur_handle.borrow();
-                                let label = if dur > 0.0 {
-                                    format!(
-                                        "{} [{}/{}]",
-                                        title_base,
-                                        format_time(cur_sec),
-                                        format_time(dur)
-                                    )
-                                } else {
-                                    format!("{} [{}]", title_base, format_time(cur_sec))
-                                };
-                                self.win.set_label(&label);
-                            }
-                            if let Some(old_frame) =
-                                self.state.frame_store.borrow_mut().replace(new_frame)
-                                && let Some(tx) = self.state.recycle_handle.borrow().as_ref()
-                            {
-                                let _ = tx.send(old_frame);
-                            }
-                            self.win.redraw();
-                        }
-                        Message::End => break PumpExit::End,
-                    },
-                    // End 之外的终止条件：所有 sender 已释放
-                    Err(mpsc::TryRecvError::Disconnected) => break PumpExit::Disconnected,
-                    Err(mpsc::TryRecvError::Empty) => break PumpExit::Empty,
-                }
-            };
-
-            // End 与 Disconnected 都要收尾：丢弃本源残留帧与通道，
-            // 避免旧数据串到下一源
-            match reason {
-                PumpExit::Empty => {}
-                PumpExit::End => {
-                    self.state.frame_store.borrow_mut().take();
-                    *self.state.recycle_handle.borrow_mut() = None;
-                    *self.state.stream_handle.borrow_mut() = None;
-                    finished = true;
-                }
-                PumpExit::Disconnected => {
-                    // 视频线程 panic 或异常退出且没能发 End：app.wait() 会一直
-                    // 挂着，用户只看到窗口停在最后一帧。这里兜底结束本源
-                    error!("frame channel closed before End; ending source");
-                    self.state.frame_store.borrow_mut().take();
-                    *self.state.recycle_handle.borrow_mut() = None;
-                    *self.state.stream_handle.borrow_mut() = None;
-                    finished = true;
-                }
-            }
-        }
-
-        // 收尾本源的 yt-dlp 子进程（自然结束则回收，提前退出则终止）
-        util::reap_child(&mut ytdlp_child);
+        session.pump(&self.app, &mut self.win);
+        session.shutdown();
 
         // 窗口仍可见则继续下一个源；用户已关闭则终止播放列表
-        self.win.visible()
+        let visible = self.win.visible();
+        if !visible {
+            self.closed = true;
+        }
+        visible
     }
 
-    // 全部源结束后调用：一个源都没播成功时返回错误
+    // 全部源结束后调用：一个源都没播成功时返回错误（用户主动关闭不算失败）
     pub fn finish(&self) -> Result<()> {
-        if self.played_any {
+        if self.played_any || self.closed {
             Ok(())
         } else {
             Err(anyhow::anyhow!("No media source could be opened"))
         }
     }
 
-    // 首个源显示窗口并初始化 GL/回调；后续源只调整尺寸与标题，复用 GL 上下文
+    // 显示/调整播放窗口：首个源初始化 GL/回调；后续源分辨率变化时重建窗口。
+    // 不能只 resize：Wayland/libdecor 下窗口 map 后再次 resize 往往不提交新的
+    // xdg_toplevel 尺寸，表现为换源后窗口尺寸卡在上一源。重建窗口同时重建
+    // GL 上下文与 RenderState，源切换本来就会清空帧，代价可接受。
     fn show_or_resize(&mut self, (w, h): (u32, u32), title: &str) {
         let win_x = ((self.screen.0 as i32 - w as i32) / 2).max(0);
         let win_y = ((self.screen.1 as i32 - h as i32) / 2 - 20).max(0);
-        self.win.resize(win_x, win_y, w as i32, h as i32);
-        self.win.set_label(title);
+        if self.win.shown() && (self.win.w() != w as i32 || self.win.h() != h as i32) {
+            let mut win = GlWindow::new(win_x, win_y, w as i32, h as i32, title);
+            win.set_mode(fltk::enums::Mode::Opengl3);
+            win.set_xclass("auv");
+            win.end();
+            // 旧窗口必须显式删除：fltk-rs 的 Widget 句柄 drop 只是 Rust 侧
+            // 释放，不会销毁原生窗口（否则换源后会留下一个旧尺寸的窗口）
+            let old = std::mem::replace(&mut self.win, win);
+            WidgetBase::delete(old);
+            self.gl_ready = false;
+        } else {
+            self.win.resize(win_x, win_y, w as i32, h as i32);
+            self.win.set_label(title);
+        }
 
         if self.gl_ready {
             self.win.redraw();
             return;
         }
-        self.win.show();
-        let rs = ui::setup_gl(&mut self.win);
+        if !self.win.shown() {
+            self.win.show();
+        }
+        let rs = ui::setup_gl(&mut self.win, self.state.snapshot_request.clone());
         ui::register_window_callbacks(&mut self.win, &self.app, &self.state, rs);
         self.gl_ready = true;
     }
