@@ -16,7 +16,7 @@ use std::{
 };
 
 use crate::{
-    demux::{SeekCtl, TimedPacket},
+    demux::{SeekCtl, SeekOutcome, TimedPacket},
     source::{SourceShared, SourceStats},
 };
 
@@ -153,6 +153,9 @@ struct AudioThread {
     space: Arc<AudioSpace>,
     // 已处理的 seek 代数
     local_epoch: u64,
+    // 可接受的最小 packet 代数：成功定位后抬高到新代数（丢弃 seek 前读出的
+    // 旧包）；定位失败时保持不变——读位置没变，在途的旧包仍然有效
+    packet_epoch_floor: u64,
     // 复用一个重采样输出帧：容量按需增长，避免每个解码帧都分配释放。
     // swr_convert_frame 会把 nb_samples 改写为实际写入样本数，
     // 所以每次调用前要重置回容量值。
@@ -226,6 +229,7 @@ impl AudioThread {
             ring_clear,
             space,
             local_epoch: 0,
+            packet_epoch_floor: 0,
             resampled: ffmpeg_next::util::frame::Audio::empty(),
             resampled_cap: 0,
         })
@@ -319,6 +323,8 @@ impl AudioThread {
     fn handle_seek(&mut self, epoch: u64) -> Result<()> {
         self.decoder.flush();
         while self.audio_rx.try_recv().is_ok() {}
+        // 读位置已变：旧代数的包全部作废
+        self.packet_epoch_floor = self.local_epoch;
         // 请求 cpal 回调清空环形缓冲（seek 前的旧音频不必播完）。
         // 回调运行正常时 ~10ms 内清空；暂停中回调不运行，则最多等 100ms
         // 后继续——标记保持置位，恢复播放后回调第一次运行仍会清空，
@@ -360,10 +366,18 @@ impl AudioThread {
                 break;
             }
             // 先响应 seek（暂停被唤醒后也会回到这里）：
-            // 就地复位并回报就绪，demux 才移动读位置并发送新包
-            if let Some((e, _t)) = self.shared.ctl.snapshot_new(self.local_epoch) {
-                self.local_epoch = e;
-                self.handle_seek(e)?;
+            // demux 已给出处理结果——定位成功则就地复位，失败则保持现状继续播
+            if let Some(decision) = self.shared.ctl.snapshot_decision(self.local_epoch) {
+                self.local_epoch = decision.epoch;
+                match decision.outcome {
+                    SeekOutcome::Reset => self.handle_seek(decision.epoch)?,
+                    // 定位失败：读位置没变，音频解码器必须保持现状。
+                    // 此时 flush/清环会丢掉正在播的音频并重置采样计数，
+                    // 主时钟会瞬间错位
+                    SeekOutcome::Failed => {
+                        self.shared.ctl.report_ready(decision.epoch);
+                    }
+                }
                 continue;
             }
 
@@ -378,8 +392,9 @@ impl AudioThread {
             // demux 阻塞在就绪屏障上而本线程阻塞在 recv 造成的死锁
             match self.audio_rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(tp) => {
-                    // 与视频同理：丢弃复位后才送达的 seek 前旧包
-                    if tp.epoch != self.local_epoch {
+                    // 与视频同理：丢弃复位后才送达的 seek 前旧包；
+                    // 定位失败时门槛不抬高，这些包仍对应当前读位置
+                    if tp.epoch < self.packet_epoch_floor {
                         continue;
                     }
                     let _ = self.decoder.send_packet(&tp.packet);
@@ -457,9 +472,14 @@ impl AudioThread {
             if self.shared.stop.load(Ordering::Relaxed) {
                 break;
             }
-            if let Some((e, _t)) = self.shared.ctl.snapshot_new(self.local_epoch) {
-                self.local_epoch = e;
-                self.handle_seek(e)?;
+            if let Some(decision) = self.shared.ctl.snapshot_decision(self.local_epoch) {
+                self.local_epoch = decision.epoch;
+                match decision.outcome {
+                    SeekOutcome::Reset => self.handle_seek(decision.epoch)?,
+                    SeekOutcome::Failed => {
+                        self.shared.ctl.report_ready(decision.epoch);
+                    }
+                }
                 continue;
             }
             match self.audio_rx.recv_timeout(Duration::from_millis(100)) {

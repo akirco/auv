@@ -18,7 +18,7 @@ use std::{
 
 use crate::{
     clock::MasterClock,
-    demux::{SeekCtl, TimedPacket},
+    demux::{SeekCtl, SeekOutcome, TimedPacket},
     dmabuf::DmaBufFrame,
     frame::{ChromaLayout, Message, YuvFrame, linesize, sar_corrected},
     source::SourceShared,
@@ -173,6 +173,10 @@ struct VideoThread {
     last_pts: Option<i64>,
     // seek 代数与复位后首帧标记
     local_epoch: u64,
+    // 可接受的最小 packet 代数：成功定位后抬高到新代数（丢弃 seek 前读出的
+    // 旧包）；定位失败时保持不变——读位置没变，在途的旧包仍然有效，丢了会
+    // 造成画面跳变
+    packet_epoch_floor: u64,
     just_seeked: bool,
     // 严重迟到时的状态机（见 LateFramePolicy）
     late_policy: LateFramePolicy,
@@ -227,6 +231,7 @@ impl VideoThread {
             force_cpu_tonemap: std::env::var_os("AUV_CPU_TONEMAP").is_some_and(|v| v != "0"),
             last_pts: None,
             local_epoch: 0,
+            packet_epoch_floor: 0,
             just_seeked: false,
             late_policy: LateFramePolicy::new(),
             decoder_skip: false,
@@ -357,18 +362,27 @@ impl VideoThread {
             if self.shared.stop.load(Ordering::Relaxed) {
                 break;
             }
-            // 先响应 seek（暂停中被唤醒后也会回到这里）
-            if let Some((e, t)) = self.shared.ctl.snapshot_new(self.local_epoch) {
-                self.local_epoch = e;
-                self.reset_for_seek(t);
+            // 先响应 seek（暂停中被唤醒后也会回到这里）：
+            // demux 已给出处理结果——定位成功则本地复位，失败则保持现状继续播
+            if let Some(decision) = self.shared.ctl.snapshot_decision(self.local_epoch) {
+                self.local_epoch = decision.epoch;
+                match decision.outcome {
+                    SeekOutcome::Reset => self.reset_for_seek(decision.target),
+                    // 定位失败：读位置没有变化，解码器必须保持现状。
+                    // 此时 flush 会清空参考帧，之后每帧都解不出来（画面直接坏掉）
+                    SeekOutcome::Failed => {
+                        self.shared.ctl.report_ready(decision.epoch);
+                    }
+                }
                 continue;
             }
             // 有界超时接收：留出每 10ms 检查一次 seek 的机会，避免 seek 时
             // demux 阻塞在就绪屏障上而本线程阻塞在 recv 造成的死锁
             match self.video_rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(tp) => {
-                    // seek 前读出的旧包可能在复位后才送达：按代数丢弃
-                    if tp.epoch != self.local_epoch {
+                    // seek 前读出的旧包在复位后才送达：按代数丢弃。
+                    // 定位失败时门槛不抬高，这些包仍然对应当前读位置，必须保留
+                    if tp.epoch < self.packet_epoch_floor {
                         continue;
                     }
                     let _ = self.decoder.as_mut().unwrap().send_packet(&tp.packet);
@@ -406,12 +420,14 @@ impl VideoThread {
     }
 
     // seek 的本地复位：flush 解码器、排空通道、清 PTS 回退、置首帧标记，
-    // 把主时钟基准设到目标点后回报就绪（demux 才移动读位置）
+    // 把主时钟基准设到目标点后回报就绪（demux 移动读位置后才发布该结果）
     fn reset_for_seek(&mut self, target: Option<f64>) {
         if let Some(d) = self.decoder.as_mut() {
             d.flush();
         }
         while self.video_rx.try_recv().is_ok() {}
+        // 读位置已变：旧代数的包全部作废
+        self.packet_epoch_floor = self.local_epoch;
         self.last_pts = None;
         self.just_seeked = true;
         self.late_policy.reset();
@@ -552,7 +568,7 @@ impl VideoThread {
                         .fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                LateAction::CatchUp => {
+                LateAction::CatchUp if self.shared.ctl.seekable() => {
                     let seek_target = self.clock.get_time_sec();
                     warn!(
                         "video {:.2}s behind; catch-up seek to {:.2}s",
@@ -564,8 +580,9 @@ impl VideoThread {
                     self.shared.stats.catchups.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                // 已放弃追帧：继续走转换/投递，慢放但不冻结
-                LateAction::Display => {}
+                // 不可 seek 的源（如 yt-dlp 管道）追不了帧：按 Display 处理，
+                // 显示迟到帧，避免永久冻屏
+                LateAction::CatchUp | LateAction::Display => {}
             }
         } else {
             self.late_policy.on_time();
@@ -1000,10 +1017,10 @@ impl VideoThread {
             if self.shared.stop.load(Ordering::Relaxed) {
                 break;
             }
-            if let Some((e, _t)) = self.shared.ctl.snapshot_new(self.local_epoch) {
-                self.local_epoch = e;
+            if let Some(decision) = self.shared.ctl.snapshot_decision(self.local_epoch) {
+                self.local_epoch = decision.epoch;
                 while self.video_rx.try_recv().is_ok() {}
-                self.shared.ctl.report_ready(e);
+                self.shared.ctl.report_ready(decision.epoch);
                 // seek 后音频可能从头再播，重新计时
                 last_samples = self.clock.audio_samples();
                 last_progress = Instant::now();
@@ -1047,10 +1064,10 @@ impl VideoThread {
             if self.shared.stop.load(Ordering::Relaxed) {
                 break;
             }
-            if let Some((e, _t)) = self.shared.ctl.snapshot_new(self.local_epoch) {
-                self.local_epoch = e;
+            if let Some(decision) = self.shared.ctl.snapshot_decision(self.local_epoch) {
+                self.local_epoch = decision.epoch;
                 while self.video_rx.try_recv().is_ok() {}
-                self.shared.ctl.report_ready(e);
+                self.shared.ctl.report_ready(decision.epoch);
                 continue;
             }
             match self.video_rx.recv_timeout(Duration::from_millis(100)) {

@@ -91,6 +91,11 @@ pub struct OpenedInput {
     pub ictx: format::context::Input,
     pub child: Option<Child>,
     pub watchdog: Option<ReadWatchdog>,
+    // 该输入是否支持定位（seek）：
+    // - 本地文件、http(s) 直链（服务端支持 Range）可以；
+    // - yt-dlp 管道是单向流，matroska 的 Cues 索引在文件末尾、管道根本读不到，
+    //   定位必然失败，这类源要在 UI 上禁用 seek。
+    pub seekable: bool,
 }
 
 // 打开媒体源：先按本地文件/直链（mp4、m3u8 等）尝试；失败且为 http(s) 链接时
@@ -121,6 +126,8 @@ pub fn open_input(source: &str) -> Result<OpenedInput> {
                     ictx,
                     child: None,
                     watchdog: Some(guard),
+                    // http(s) 直链由 FFmpeg 的 HTTP 协议按 Range 请求定位
+                    seekable: true,
                 })
             } else {
                 guard.disarm();
@@ -128,6 +135,7 @@ pub fn open_input(source: &str) -> Result<OpenedInput> {
                     ictx,
                     child: None,
                     watchdog: None,
+                    seekable: true,
                 })
             }
         }
@@ -198,6 +206,9 @@ pub fn open_input(source: &str) -> Result<OpenedInput> {
                         ictx,
                         child: Some(child),
                         watchdog: Some(stream_guard),
+                        // 管道是单向流：matroska 的 Cues 索引在文件末尾，
+                        // 管道读不到，也无法回退到文件开头，定位必然失败
+                        seekable: false,
                     })
                 }
                 Err(e) => {

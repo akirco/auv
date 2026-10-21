@@ -147,6 +147,7 @@ impl Player {
             ictx,
             mut child,
             watchdog,
+            seekable,
         } = match self.open_interactive(source) {
             OpenOutcome::Opened(opened) => opened,
             OpenOutcome::Failed => return true,
@@ -193,6 +194,7 @@ impl Player {
             volume: self.state.volume.clone(),
             mute: self.state.mute.clone(),
             audio: &self.audio,
+            seekable,
         });
         session.start(&self.state);
         self.played_any = true;

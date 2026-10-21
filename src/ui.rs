@@ -147,6 +147,12 @@ pub fn register_window_callbacks(
                 // 当前位置取当前显示帧的 pts；总时长未知时只保证不为负
                 let ctl = seek_keys.borrow().clone();
                 if let Some(ctl) = ctl {
+                    // 不可 seek 的源（yt-dlp 管道）：定位必然失败，直接忽略，
+                    // 避免无谓的解码器复位（会丢掉参考帧导致画面损坏）
+                    if !ctl.seekable() {
+                        info!("Seek ignored: this source is not seekable");
+                        return true;
+                    }
                     let cur = frame_store_keys
                         .borrow()
                         .as_ref()

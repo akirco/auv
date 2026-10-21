@@ -47,6 +47,8 @@ pub struct SessionInputs<'a> {
     pub volume: Arc<AtomicU32>,
     pub mute: Arc<AtomicBool>,
     pub audio: &'a AudioOutput,
+    // 该源是否支持定位（seek）：yt-dlp 管道为 false，UI 不应发起 seek
+    pub seekable: bool,
 }
 
 pub struct SourceSession {
@@ -63,6 +65,8 @@ pub struct SourceSession {
     ictx: Option<ffmpeg_next::format::context::Input>,
     ytdlp_child: Option<Child>,
     watchdog: Option<util::ReadWatchdog>,
+    // 该源是否支持定位（seek）
+    seekable: bool,
     // 运行期句柄（start 之后才有）
     rx: Option<mpsc::Receiver<Message>>,
     shared: Option<Arc<SourceShared>>,
@@ -106,6 +110,7 @@ impl SourceSession {
             volume,
             mute,
             audio,
+            seekable,
         } = inputs;
         Self {
             info,
@@ -121,6 +126,7 @@ impl SourceSession {
             ictx: Some(ictx),
             ytdlp_child,
             watchdog,
+            seekable,
             rx: None,
             shared: None,
             seek_ctl: None,
@@ -258,6 +264,8 @@ impl SourceSession {
 
         // seek 协调器：视频线程恒 1，音频线程按需 +1
         let seek_ctl = Arc::new(SeekCtl::new(1 + usize::from(has_audio_thread)));
+        // 不可 seek 的源（yt-dlp 管道）：UI 不发起 seek，定位失败也不会复位解码器
+        seek_ctl.set_seekable(self.seekable);
         *self.seek_handle.borrow_mut() = Some(seek_ctl.clone());
 
         // 有界通道：UI 卡顿时视频线程在 send 上背压，防止帧无限堆积
@@ -284,6 +292,7 @@ impl SourceSession {
             timeline_origin,
             stop: stop.clone(),
             watchdog: self.watchdog.take(),
+            paused: self.paused.clone(),
         }));
 
         let audio_done = Arc::new(AtomicBool::new(false));
