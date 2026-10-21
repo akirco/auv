@@ -9,7 +9,14 @@ use fltk::{
     window::{GlWindow, Window},
 };
 use log::warn;
-use std::sync::mpsc;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
+};
 
 use crate::{
     demux::extract_streams,
@@ -30,6 +37,26 @@ enum OpenOutcome {
 // 后台打开线程通过通道返回的结果；错误转成字符串以便跨线程传递
 type OpenResult = std::result::Result<util::OpenedInput, String>;
 
+// 预取中的下一个源：后台线程按"临近结尾"的时刻开始打开，结果经通道交回。
+// started：线程已进入 open_input（不再处于等待开工的睡眠阶段）；
+// cancel：放弃预取（还没开工就退出；已开工的结果没人要时会回收子进程）。
+struct Prefetch {
+    source: String,
+    rx: mpsc::Receiver<OpenResult>,
+    started: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+}
+
+// 预取开工时间：提前 PREFETCH_LEAD 秒打开下一个源；比它短的源立即开始。
+// dur 未知（0，直播等）时返回 None：不预取，避免长时间挂着一个网络连接
+fn prefetch_delay(dur: f64) -> Option<Duration> {
+    const PREFETCH_LEAD: f64 = 10.0;
+    if dur <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64((dur - PREFETCH_LEAD).max(0.0)))
+}
+
 // 播放器：持有窗口、跨源共享状态与音频配置，逐个源推进播放列表。
 pub struct Player {
     win: GlWindow,
@@ -42,6 +69,8 @@ pub struct Player {
     // 首个源打开期间的纯色占位窗口。不能复用 GlWindow：Wayland 下先 show
     // 640×480 再 resize 到视频尺寸不会提交新的 xdg_toplevel 尺寸
     splash: Option<Window>,
+    // 当前源播放期间提前打开的下一个源（见 start_prefetch）
+    prefetch: Option<Prefetch>,
     played_any: bool,
     // 用户在打开/播放期间关闭了窗口：finish() 不应再报"没有可播放的源"
     closed: bool,
@@ -57,6 +86,7 @@ impl Player {
             audio,
             gl_ready: false,
             splash: None,
+            prefetch: None,
             played_any: false,
             closed: false,
         }
@@ -137,18 +167,134 @@ impl Player {
         }
     }
 
+    // 在当前源播放期间提前打开下一个源。开工时刻见 prefetch_delay：
+    // 只提前 10s，避免网络源/yt-dlp 在整个片长里挂着一个空闲连接。
+    fn start_prefetch(&mut self, next: &str, dur: f64) {
+        self.discard_prefetch();
+        let Some(delay) = prefetch_delay(dur) else {
+            return;
+        };
+        log::debug!("prefetching {} in {:.1}s", next, delay.as_secs_f64());
+        let (tx, rx) = mpsc::channel::<OpenResult>();
+        let source = next.to_string();
+        let src = source.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (started_thread, cancel_thread) = (started.clone(), cancel.clone());
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + delay;
+            while Instant::now() < deadline {
+                if cancel_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                // 100ms 粒度轮询取消，最迟在源结束时立刻退出
+                let nap = Duration::from_millis(100)
+                    .min(deadline.saturating_duration_since(Instant::now()));
+                std::thread::sleep(nap);
+            }
+            if cancel_thread.load(Ordering::Relaxed) {
+                return;
+            }
+            started_thread.store(true, Ordering::Relaxed);
+            let res = util::open_input(&src).map_err(|e| format!("{e:#}"));
+            match tx.send(res) {
+                // 唤醒可能正阻塞在 app.wait() 的 UI 线程
+                Ok(()) => app::awake(),
+                // 主线程已经换源/关窗：没人要这个结果，yt-dlp 子进程必须显式回收
+                Err(mpsc::SendError(res)) => {
+                    if let Ok(mut opened) = res {
+                        util::reap_child(&mut opened.child);
+                    }
+                }
+            }
+        });
+        self.prefetch = Some(Prefetch {
+            source,
+            rx,
+            started,
+            cancel,
+        });
+    }
+
+    // 放弃预取：取消还没开工的线程；已经有结果就把 yt-dlp 子进程收掉
+    fn discard_prefetch(&mut self) {
+        let Some(p) = self.prefetch.take() else {
+            return;
+        };
+        p.cancel.store(true, Ordering::Relaxed);
+        if let Ok(Ok(mut opened)) = p.rx.try_recv() {
+            util::reap_child(&mut opened.child);
+        }
+    }
+
+    // 取走与 source 匹配的预取；不匹配（播放列表被改/顺序变化）则丢弃
+    fn take_prefetch(&mut self, source: &str) -> Option<Prefetch> {
+        if self.prefetch.as_ref().is_some_and(|p| p.source == source) {
+            self.prefetch.take()
+        } else {
+            self.discard_prefetch();
+            None
+        }
+    }
+
+    // 使用预取结果：已就绪直接取；正在打开就等它（同样泵 UI 事件）；
+    // 还停在"等临近结尾"的睡眠阶段（例如用户提前跳到片尾）则取消，
+    // 按普通路径重新打开——此时总等待时间与不预取时相同
+    fn await_prefetch(&mut self, p: Prefetch, source: &str) -> OpenOutcome {
+        let Prefetch {
+            rx,
+            started,
+            cancel,
+            ..
+        } = p;
+        if !started.load(Ordering::Relaxed) {
+            cancel.store(true, Ordering::Relaxed);
+            return self.open_interactive(source);
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(Ok(opened)) => {
+                    log::debug!("using prefetched input for {}", source);
+                    return OpenOutcome::Opened(opened);
+                }
+                // 预取在 10s 前失败了，用户此刻仍想播：重新试一次
+                Ok(Err(e)) => {
+                    warn!("Prefetch of {} failed: {}; opening now", source, e);
+                    return self.open_interactive(source);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return self.open_interactive(source);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if !self.app.wait() {
+                        self.closed = true;
+                        // 线程还在打开：置取消并尽快退出；结果无人接收时
+                        // 由线程自己回收 yt-dlp 子进程
+                        cancel.store(true, Ordering::Relaxed);
+                        return OpenOutcome::Closed;
+                    }
+                }
+            }
+        }
+    }
+
     // 播放一个源；返回 false 表示窗口已被关闭、播放列表应终止。
     // 打不开或没有视频流的源会记警告后跳过，返回 true 继续下一个。
-    pub fn play(&mut self, source: &str) -> bool {
+    // next 是播放列表里的下一个源：本轮播放期间会提前打开它。
+    pub fn play(&mut self, source: &str, next: Option<&str>) -> bool {
         // 先把窗口显示出来（首个源用默认尺寸），再异步打开：
         // 打开/探测是阻塞 I/O，最长可能 20s，期间仍要能重绘与响应关闭
         self.show_loading(source);
+        let opened = match self.take_prefetch(source) {
+            Some(p) => self.await_prefetch(p, source),
+            None => self.open_interactive(source),
+        };
         let util::OpenedInput {
             ictx,
             mut child,
             watchdog,
             seekable,
-        } = match self.open_interactive(source) {
+        } = match opened {
             OpenOutcome::Opened(opened) => opened,
             OpenOutcome::Failed => return true,
             OpenOutcome::Closed => return false,
@@ -198,6 +344,10 @@ impl Player {
         });
         session.start(&self.state);
         self.played_any = true;
+        // 源已经起播：若列表里还有下一个，按剩余时长安排预取
+        if let Some(next) = next {
+            self.start_prefetch(next, dur);
+        }
         session.pump(&self.app, &mut self.win);
         session.shutdown();
 
@@ -210,7 +360,8 @@ impl Player {
     }
 
     // 全部源结束后调用：一个源都没播成功时返回错误（用户主动关闭不算失败）
-    pub fn finish(&self) -> Result<()> {
+    pub fn finish(&mut self) -> Result<()> {
+        self.discard_prefetch();
         if self.played_any || self.closed {
             Ok(())
         } else {
@@ -250,5 +401,23 @@ impl Player {
         let rs = ui::setup_gl(&mut self.win, self.state.snapshot_request.clone());
         ui::register_window_callbacks(&mut self.win, &self.app, &self.state, rs);
         self.gl_ready = true;
+    }
+}
+
+// GL 初始化/回调之外的纯逻辑单测
+#[cfg(test)]
+mod tests {
+    use super::prefetch_delay;
+    use std::time::Duration;
+
+    // 预取只在临近结尾时开工：长片提前 10s，短片立即；时长未知（直播）不预取
+    #[test]
+    fn prefetch_delay_schedules_near_end_only() {
+        assert_eq!(prefetch_delay(0.0), None);
+        assert_eq!(prefetch_delay(-1.0), None);
+        assert_eq!(prefetch_delay(4.0), Some(Duration::ZERO));
+        assert_eq!(prefetch_delay(10.0), Some(Duration::ZERO));
+        assert_eq!(prefetch_delay(60.0), Some(Duration::from_secs(50)));
+        assert_eq!(prefetch_delay(3600.0), Some(Duration::from_secs(3590)));
     }
 }

@@ -62,9 +62,11 @@ fn main() -> Result<()> {
     let audio = AudioOutput::detect();
     log::debug!("audio output ready");
     let mut player = Player::new(win, app, screen, audio);
-    for source in &sources {
-        // play 返回 false 表示用户关闭了窗口，终止播放列表
-        if !player.play(source) {
+    for (i, source) in sources.iter().enumerate() {
+        // play 返回 false 表示用户关闭了窗口，终止播放列表；
+        // next 用于在当前源播放期间提前打开下一个源
+        let next = sources.get(i + 1).map(String::as_str);
+        if !player.play(source, next) {
             break;
         }
     }
