@@ -338,19 +338,36 @@ impl YuvFrame {
             return None;
         };
         let (u, v, uv_stride) = if self.is_semi_planar() {
-            // 半平面在 UI 线程拆成 U/V 两份，后台截图代码仍按平面处理
+            // 半平面在 UI 线程拆成 U/V 两份，后台截图代码仍按平面处理。
+            // 按行取 uv 平面一次，再逐对拆交错样本（8/10bit 分开写，常量步长
+            // 便于向量化；逐像素调 self.uv() + 1 字节 copy 在 4K 下要十几 ms）
             let cw = (self.width as usize).div_ceil(2);
             let ch = (self.height as usize).div_ceil(2);
             let bps = self.bytes_per_sample();
             let stride = self.uv_stride as usize;
+            let uv = self.uv();
+            let row_src = cw * 2 * bps;
+            let row_dst = cw * bps;
             let mut up = vec![0u8; cw * ch * bps];
             let mut vp = vec![0u8; cw * ch * bps];
             for row in 0..ch {
-                for x in 0..cw {
-                    let src = row * stride + x * 2 * bps;
-                    let dst = (row * cw + x) * bps;
-                    up[dst..dst + bps].copy_from_slice(&self.uv()[src..src + bps]);
-                    vp[dst..dst + bps].copy_from_slice(&self.uv()[src + bps..src + 2 * bps]);
+                let src = &uv[row * stride..row * stride + row_src];
+                let up_row = &mut up[row * row_dst..(row + 1) * row_dst];
+                let vp_row = &mut vp[row * row_dst..(row + 1) * row_dst];
+                if bps == 1 {
+                    let (pairs, _) = src.as_chunks::<2>();
+                    for ((u, v), px) in up_row.iter_mut().zip(vp_row.iter_mut()).zip(pairs) {
+                        *u = px[0];
+                        *v = px[1];
+                    }
+                } else {
+                    let (pairs, _) = src.as_chunks::<4>();
+                    let (up2, _) = up_row.as_chunks_mut::<2>();
+                    let (vp2, _) = vp_row.as_chunks_mut::<2>();
+                    for ((u, v), px) in up2.iter_mut().zip(vp2.iter_mut()).zip(pairs) {
+                        *u = [px[0], px[1]];
+                        *v = [px[2], px[3]];
+                    }
                 }
             }
             (up, vp, (cw * bps) as i32)
@@ -579,5 +596,56 @@ mod tests {
         // 帧被回收（销毁）后快照仍持有数据
         drop(f);
         assert!(!snap.y.is_empty());
+    }
+
+    // 半平面拆分的字节内容：U/V 必须逐对拆开并按 stride 取行。
+    // 原实现逐像素调 uv()，这里同时锁住"拆对了"与"没读串行"
+    #[test]
+    fn semi_planar_snapshot_deinterleaves_uv() {
+        for (pix, depth, bps) in [(Pixel::NV12, 8u8, 1usize), (Pixel::P010LE, 10, 2)] {
+            let (w, h) = (6u32, 4u32);
+            let mut f = ffmpeg_next::util::frame::video::Video::empty();
+            unsafe { f.alloc(pix, w, h) };
+            let stride = f.stride(1);
+            {
+                let uv = f.data_mut(1);
+                for (i, b) in uv.iter_mut().enumerate() {
+                    *b = (i % 97) as u8;
+                }
+            }
+            let uv_src = f.data(1).to_vec();
+            let frame = YuvFrame::new_semi(
+                Box::new(f),
+                depth,
+                0.0,
+                Space::BT709,
+                Range::MPEG,
+                TransferCharacteristic::Unspecified,
+                Primaries::Unspecified,
+                w as i32,
+                h as i32,
+                0,
+            );
+            let snap = frame.snapshot().unwrap();
+            let cw = (w as usize).div_ceil(2);
+            let ch = (h as usize).div_ceil(2);
+            assert_eq!(snap.u.len(), cw * ch * bps);
+            for row in 0..ch {
+                for x in 0..cw {
+                    let src = row * stride + x * 2 * bps;
+                    let dst = (row * cw + x) * bps;
+                    assert_eq!(
+                        &snap.u[dst..dst + bps],
+                        &uv_src[src..src + bps],
+                        "{pix:?} U row={row} x={x}"
+                    );
+                    assert_eq!(
+                        &snap.v[dst..dst + bps],
+                        &uv_src[src + bps..src + 2 * bps],
+                        "{pix:?} V row={row} x={x}"
+                    );
+                }
+            }
+        }
     }
 }

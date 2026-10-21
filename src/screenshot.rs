@@ -76,14 +76,18 @@ pub fn spawn_save_rgb(w: i32, h: i32, rgb: Vec<u8>) {
     });
 }
 
-// GL 的像素原点在左下，PNG 行序要求自上而下
+// GL 的像素原点在左下，PNG 行序要求自上而下。
+// 整行 memcpy（3 次）代替逐字节 swap（4K 下约 1200 万次）
 fn flip_rows(rgb: &mut [u8], w: usize, h: usize) {
     let stride = w * 3;
+    let mut tmp = vec![0u8; stride];
     for y in 0..h / 2 {
-        let (top, bottom) = (y * stride, (h - 1 - y) * stride);
-        for x in 0..stride {
-            rgb.swap(top + x, bottom + x);
-        }
+        let (top, bottom) = rgb.split_at_mut((h - 1 - y) * stride);
+        let top = &mut top[y * stride..y * stride + stride];
+        let bottom = &mut bottom[..stride];
+        tmp.copy_from_slice(top);
+        top.copy_from_slice(bottom);
+        bottom.copy_from_slice(&tmp);
     }
 }
 
@@ -460,6 +464,24 @@ mod tests {
             let (rw, rh, rgb) = yuv_to_rgb(&frame).unwrap();
             assert_eq!((rw, rh), (w, h));
             assert_eq!(rgb.len(), w * h * 3);
+        }
+    }
+
+    // GL 读回的行序是自下而上：翻转必须整行搬，奇偶高度都不能丢/重行
+    #[test]
+    fn flip_rows_reverses_row_order() {
+        for h in [1usize, 2, 3, 4, 5] {
+            let (w, stride) = (2usize, 6usize);
+            // 每行填行号，翻转后第 y 行应等于 h-1-y
+            let mut rgb: Vec<u8> = (0..h).flat_map(|y| vec![y as u8; stride]).collect();
+            flip_rows(&mut rgb, w, h);
+            for y in 0..h {
+                assert_eq!(
+                    &rgb[y * stride..(y + 1) * stride],
+                    &vec![(h - 1 - y) as u8; stride][..],
+                    "h={h} row={y}"
+                );
+            }
         }
     }
 }
