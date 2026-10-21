@@ -8,7 +8,7 @@ use std::{
 };
 
 use ffmpeg_next::util::color::{Primaries, Range, Space, TransferCharacteristic};
-use fltk::window::GlWindow;
+use fltk::{prelude::*, window::GlWindow};
 use log::error;
 
 use crate::{
@@ -242,7 +242,7 @@ pub unsafe fn setup_opengl(snap_request: Arc<AtomicBool>) -> RenderState {
 // 绘制一帧：按视频显示宽高比（含 SAR 修正）居中留黑边。
 // 纹理存储只在尺寸变化时重新分配；此后每帧把数据写进 PBO（CPU 快速拷贝），
 // 再 TexSubImage2D 让 GPU 异步 DMA 到纹理，三缓冲 + fence 避免 CPU 阻塞等待上传。
-pub fn draw_frame(w: &GlWindow, state: &RenderState, frame: &YuvFrame) {
+pub fn draw_frame(w: &mut GlWindow, state: &RenderState, frame: &YuvFrame) {
     unsafe {
         // HiDPI/Wayland 下 GL 视口以物理像素计，用 pixel_* 而非逻辑尺寸
         let win_w = w.pixel_w() as f32;
@@ -415,6 +415,11 @@ pub fn draw_frame(w: &GlWindow, state: &RenderState, frame: &YuvFrame) {
                     state.pbo_cur.set((cur + 1) % 3);
 
                     gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
+                } else {
+                    // 槽位仍忙：纹理保持上一帧。必须主动再排一次重绘，否则只有
+                    // 下一帧到来才会重试，这一帧就被静默丢掉了。重试本身受
+                    // wait_fence 的 16ms 上限节流，最坏约 60 次/s
+                    w.redraw();
                 }
             }
         }
@@ -470,6 +475,10 @@ impl RenderState {
                 std::mem::forget(images);
                 // 已绑定的纹理仍引用这些存储，surface 也不能立刻回收
                 std::mem::forget(retained);
+                // 部分纹理的存储已被 EGLImage 替换：必须让下一帧 CPU 路径重新
+                // TexImage2D，否则会往 EGLImage 存储里 TexSubImage2D（GL 错误，
+                // 画面持续错乱）。这条路径之后零拷贝已全局关闭，下一帧必然走 CPU
+                self.tex_size.set((-1, -1, 0, false));
                 egl::disable("glEGLImageTargetTexture2DOES failed");
                 return None;
             }
