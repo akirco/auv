@@ -125,6 +125,25 @@ auv [options] <file_or_url>...
 
 在 Hyprland 下，全屏切换通过 `hyprctl` 执行，因此需要确保 `hyprctl` 可用。
 
+### 窗口尺寸与平铺
+
+在 Wayland（Hyprland / Sway 等）下，窗口尺寸由**合成器**决定：AUV 不再把视频分辨率
+作为窗口尺寸约束交给合成器（FLTK 默认会把窗口尺寸同时作为 min/max 上报，
+固定尺寸的窗口合成器无法平铺），视频按比例居中显示，窗口四周留黑边。
+因此可以直接用合成器规则控制窗口，例如：
+
+```lua
+hl.window_rule({
+	name = "auv-video",
+	match = { class = "^(auv)$" },
+	tile = true,
+	no_blur = true,
+	opaque = true,
+})
+```
+
+在 X11 下没有合成器接管尺寸，窗口仍按视频分辨率（不超过屏幕）创建。
+
 ## 网页链接
 
 AUV 会先尝试让 FFmpeg 直接打开 HTTP/HTTPS 地址。直接打开失败后，会自动调用：

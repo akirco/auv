@@ -2,7 +2,7 @@
 // 主程序只负责装配与源循环，窗口回调（绘制/按键）与纯展示换算都归这里。
 use cpal::traits::StreamTrait;
 use fltk::{app, prelude::*, window::GlWindow};
-use log::info;
+use log::{error, info};
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -60,13 +60,31 @@ impl PlayerState {
     }
 }
 
-// 初始化 GL 上下文并构建渲染状态（首个源显示窗口后调用一次）
-pub fn setup_gl(win: &mut GlWindow, snap_request: Arc<AtomicBool>) -> render::RenderState {
+// 初始化 GL 上下文并构建渲染状态（首个源显示窗口后调用一次）。
+// 失败时返回 Err(原因)：着色器编译/链接失败时继续绘制只会得到一块黑屏，
+// 调用方应明确报错，而不是让用户对着黑窗猜。
+pub fn setup_gl(
+    win: &mut GlWindow,
+    snap_request: Arc<AtomicBool>,
+) -> Result<render::RenderState, &'static str> {
+    // 窗口没显示时不能 make_current：FLTK 会弹模态警告框（fl_alert）并
+    // 直接终止进程。用户刚关窗的场景必须挡住这一步
+    if !win.shown() {
+        error!("OpenGL setup skipped: window is not shown");
+        return Err("window was closed");
+    }
     win.make_current();
     // 呈现节奏锁定显示器刷新率，避免无谓的满速 present 抢占 GPU
     win.set_swap_interval(1);
     gl::load_with(|s| win.get_proc_address(s) as *const _);
-    unsafe { render::setup_opengl(snap_request) }
+    let rs = unsafe { render::setup_opengl(snap_request) };
+    match rs {
+        Some(rs) => Ok(rs),
+        None => {
+            error!("OpenGL setup failed: shader compilation/linking error");
+            Err("shader compilation/linking failed")
+        }
+    }
 }
 
 // 注册绘制与按键回调（窗口首次显示时调用一次）。
@@ -75,16 +93,17 @@ pub fn register_window_callbacks(
     win: &mut GlWindow,
     app_handle: &fltk::app::App,
     state: &PlayerState,
-    rs: render::RenderState,
+    rs: std::rc::Rc<render::RenderState>,
 ) {
     let draw_store = state.frame_store.clone();
     let overlay_draw = state.overlay.clone();
+    let rs_draw = rs.clone();
     win.draw(move |w| {
         let frame_guard = draw_store.borrow();
         if let Some(frame) = frame_guard.as_ref() {
-            draw_frame(w, &rs, frame);
+            draw_frame(w, &rs_draw, frame);
             // 时间叠在视频右上角（窗口标题只留媒体名）
-            render::draw_time_overlay(w, &rs, &overlay_draw.borrow());
+            render::draw_time_overlay(w, &rs_draw, &overlay_draw.borrow());
         }
     });
 

@@ -10,6 +10,7 @@ use fltk::{
 };
 use log::warn;
 use std::{
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -20,6 +21,7 @@ use std::{
 
 use crate::{
     demux::extract_streams,
+    render,
     session::{SessionInputs, SourceSession},
     ui::{self, PlayerState, calc_display_size},
     util,
@@ -64,8 +66,18 @@ pub struct Player {
     state: PlayerState,
     // 屏幕逻辑尺寸（app::screen_size()），用于窗口居中/缩放
     screen: (f64, f64),
-    audio: AudioOutput,
+    // 音频输出：后台探测完成后由 resolve_audio 填入，起播前一定已就绪
+    audio: Option<AudioOutput>,
+    // 后台探测中的结果通道（只取一次；探测与打开首个源并行）
+    audio_rx: Option<mpsc::Receiver<AudioOutput>>,
     gl_ready: bool,
+    // 上次按视频分辨率请求的窗口尺寸：只有视频分辨率变了才重建窗口。
+    // 窗口**实际**尺寸由合成器决定（平铺/全屏），拿它和视频分辨率比较会
+    // 导致每次换源都重建 GL 上下文
+    requested_size: Option<(u32, u32)>,
+    // 当前窗口的渲染状态：窗口/GL 上下文销毁前必须先释放 GL/EGL 资源，
+    // 因此这里持有一份引用（绘制回调里也有一份）
+    rs: Option<Rc<render::RenderState>>,
     // 首个源打开期间的纯色占位窗口。不能复用 GlWindow：Wayland 下先 show
     // 640×480 再 resize 到视频尺寸不会提交新的 xdg_toplevel 尺寸
     splash: Option<Window>,
@@ -77,14 +89,24 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(win: GlWindow, app: app::App, screen: (f64, f64), audio: AudioOutput) -> Self {
+    pub fn new(win: GlWindow, app: app::App, screen: (f64, f64)) -> Self {
+        // 音频设备探测会枚举支持的配置（PipeWire/ALSA 下可能要几十~几百 ms）。
+        // 放到后台与第一个源的打开并行，不能挡在窗口出现之前
+        let (audio_tx, audio_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = audio_tx.send(AudioOutput::detect());
+            app::awake(); // 唤醒可能正阻塞在 app.wait() 的 UI 线程
+        });
         Self {
             win,
             app,
             state: PlayerState::new(),
             screen,
-            audio,
+            audio: None,
+            audio_rx: Some(audio_rx),
             gl_ready: false,
+            requested_size: None,
+            rs: None,
             splash: None,
             prefetch: None,
             played_any: false,
@@ -133,6 +155,44 @@ impl Player {
         if let Some(mut s) = self.splash.take() {
             s.hide();
             WidgetBase::delete(s);
+        }
+    }
+
+    // 等待后台音频探测结果。探测与打开首个源并行，通常到这里已经完成；
+    // 源打开得很快时就泵事件等它（此时 splash 已可见，窗口不会假死）。
+    // 返回 false 表示窗口在等待期间被关闭。
+    fn resolve_audio(&mut self) -> bool {
+        if self.audio.is_some() {
+            return true;
+        }
+        let Some(rx) = self.audio_rx.take() else {
+            return true;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(audio) => {
+                    self.audio = Some(audio);
+                    log::debug!("audio output ready");
+                    return true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // 探测线程 panic：降级为无音频输出，视频照常播放（主时钟走墙钟）
+                    warn!("audio detection thread failed; playing without audio output");
+                    self.audio = Some(AudioOutput {
+                        device: None,
+                        sample_rate: 0,
+                        channels: 0,
+                        config: None,
+                    });
+                    return true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if !self.app.wait() {
+                        self.closed = true;
+                        return false;
+                    }
+                }
+            }
         }
     }
 
@@ -309,6 +369,12 @@ impl Player {
                 return true;
             }
         };
+        // 音频探测与打开源并行，到这里通常已完成；未完成则泵事件等它。
+        // 必须在这里（而不是 play 开头）等：先让 open_input 跑起来，两者重叠
+        if !self.resolve_audio() {
+            util::reap_child(&mut child);
+            return false;
+        }
         let win_size = calc_display_size(info.disp_w.max(1), info.disp_h.max(1));
         log::debug!(
             "source display={}x{} window={:?} screen={:?}",
@@ -338,7 +404,10 @@ impl Player {
             paused: self.state.paused.clone(),
             volume: self.state.volume.clone(),
             mute: self.state.mute.clone(),
-            audio: &self.audio,
+            audio: self
+                .audio
+                .as_ref()
+                .expect("audio resolved before session start"),
             seekable,
         });
         session.start(&self.state);
@@ -361,6 +430,18 @@ impl Player {
     // 全部源结束后调用：一个源都没播成功时返回错误（用户主动关闭不算失败）
     pub fn finish(&mut self) -> Result<()> {
         self.discard_prefetch();
+        // 退出前释放 GL/EGL 资源：窗口还在、上下文仍能激活时做完整清理。
+        // 用户已经关窗时窗口不再 shown()——FLTK 的 make_current() 对未显示的
+        // 窗口会弹模态警告框（fl_alert）并直接终止进程，绝不能调
+        if let Some(rs) = self.rs.take() {
+            if self.win.shown() {
+                self.win.make_current();
+                rs.cleanup();
+            } else {
+                // 上下文已无法激活：只释放不依赖上下文的资源
+                rs.release_without_context();
+            }
+        }
         if self.played_any || self.closed {
             Ok(())
         } else {
@@ -375,11 +456,30 @@ impl Player {
     fn show_or_resize(&mut self, (w, h): (u32, u32), title: &str) {
         let win_x = ((self.screen.0 as i32 - w as i32) / 2).max(0);
         let win_y = ((self.screen.1 as i32 - h as i32) / 2 - 20).max(0);
-        if self.win.shown() && (self.win.w() != w as i32 || self.win.h() != h as i32) {
+        // 只在视频分辨率变化时重建窗口
+        let size_changed = self.requested_size != Some((w, h));
+        self.requested_size = Some((w, h));
+        if self.win.shown() && size_changed {
             let mut win = GlWindow::new(win_x, win_y, w as i32, h as i32, title);
             win.set_mode(fltk::enums::Mode::Opengl3);
             win.set_xclass("auv");
+            // 尺寸不受限（见 main.rs 的同一处说明）：Wayland 下 FLTK 会把窗口
+            // 尺寸作为 min/max 约束告诉合成器，固定尺寸的窗口无法被平铺
+            win.size_range(1, 1, 0, 0);
             win.end();
+            // 旧窗口的 GL 上下文即将销毁：先在它仍然有效时释放 GL/EGL 资源。
+            // 顺序不能反——纹理先删（EGLImage 的存储还被引用），再销毁 EGLImage，
+            // 最后才删窗口；上下文没了之后再调 GL/EGL 是未定义行为。
+            // 窗口已被用户关掉时不能 make_current（FLTK 会弹模态警告框），
+            // 只能释放不依赖上下文的资源
+            if let Some(rs) = self.rs.take() {
+                if self.win.shown() {
+                    self.win.make_current();
+                    rs.cleanup();
+                } else {
+                    rs.release_without_context();
+                }
+            }
             // 旧窗口必须显式删除：fltk-rs 的 Widget 句柄 drop 只是 Rust 侧
             // 释放，不会销毁原生窗口（否则换源后会留下一个旧尺寸的窗口）
             let old = std::mem::replace(&mut self.win, win);
@@ -397,7 +497,20 @@ impl Player {
         if !self.win.shown() {
             self.win.show();
         }
-        let rs = ui::setup_gl(&mut self.win, self.state.snapshot_request.clone());
+        let rs = match ui::setup_gl(&mut self.win, self.state.snapshot_request.clone()) {
+            Ok(rs) => rs,
+            Err(reason) => {
+                // 没有可用的渲染状态：窗口保持可见但不再绘制，标题里写明原因，
+                // 用户至少知道不是"卡住了"
+                self.win
+                    .set_label(&format!("AUV - OpenGL setup failed: {reason}"));
+                self.win.redraw();
+                self.gl_ready = false;
+                return;
+            }
+        };
+        let rs = Rc::new(rs);
+        self.rs = Some(rs.clone());
         ui::register_window_callbacks(&mut self.win, &self.app, &self.state, rs);
         self.gl_ready = true;
     }

@@ -2,7 +2,7 @@ use anyhow::Result;
 use fltk::{app, prelude::*, window::GlWindow};
 
 use auv::cli::{CliAction, USAGE, parse_cli};
-use auv::player::{AudioOutput, Player};
+use auv::player::Player;
 
 fn main() -> Result<()> {
     // 日志分级（RUST_LOG 控制）：默认 info；worker 线程与主循环共用同一 logger
@@ -55,13 +55,21 @@ fn main() -> Result<()> {
     // Wayland app_id / X11 class：Hyprland 等合成器可用它给视频窗口下
     // noblur/norounding/opaque 规则，减少合成开销
     win.set_xclass("auv");
+    // 尺寸不受限（min 1x1、无上限）。
+    //
+    // FLTK 的 Fl_Window::default_size_range()：窗口没有 resizable() 子部件时，
+    // 默认取 size_range(w(), h(), w(), h())——即 min = max = 当前尺寸。
+    // Wayland 下 FLTK 把它作为 xdg_toplevel 的 min/max 尺寸约束发给合成器，
+    // 固定尺寸的窗口合成器无法平铺（平铺尺寸会违反约束），只能浮动 +
+    // 保持请求的尺寸——这正是"窗口不平铺、尺寸也不对"的根因。
+    // 显式声明 min=1x1、无上限，合成器才能自由分配尺寸（平铺时给整屏尺寸），
+    // 视频在窗口内按比例留黑边显示。
+    win.size_range(1, 1, 0, 0);
     win.end();
 
-    // 播放器负责后续所有源的打开、线程装配与 UI 消息泵
-    log::debug!("detecting audio output");
-    let audio = AudioOutput::detect();
-    log::debug!("audio output ready");
-    let mut player = Player::new(win, app, screen, audio);
+    // 播放器负责后续所有源的打开、线程装配与 UI 消息泵。
+    // 音频设备在后台探测（见 Player::new），不会挡在窗口出现之前
+    let mut player = Player::new(win, app, screen);
     for (i, source) in sources.iter().enumerate() {
         // play 返回 false 表示用户关闭了窗口，终止播放列表；
         // next 用于在当前源播放期间提前打开下一个源

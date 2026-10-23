@@ -18,6 +18,10 @@ pub struct MasterClock {
     has_audio: bool,
     // 音频输出失效（设备出错等）时置 true：主时钟退回系统时钟继续播放
     audio_dead: Arc<AtomicBool>,
+    // 音频轨播完（正常 EOF，环缓冲已排空）时置 true：采样计数不再前进，
+    // 继续用样本时钟会让主时钟冻结——视频帧全被判为"提前"且不再节流，
+    // 片尾会变成快进。置位后同样退回墙钟继续按实时速度走。
+    audio_done: Arc<AtomicBool>,
     // 音频输出延迟（样本数 = 帧数×声道）：回调写入的样本要等驱动缓冲排空才真正
     // 从设备播出。样本时钟减去它才是"此刻听到的位置"，否则视频会提前一个 period
     latency_samples: Arc<AtomicU64>,
@@ -40,6 +44,7 @@ impl MasterClock {
         channels: u32,
         has_audio: bool,
         audio_dead: Arc<AtomicBool>,
+        audio_done: Arc<AtomicBool>,
     ) -> (Self, Arc<AtomicU64>) {
         let samples_played = Arc::new(AtomicU64::new(0));
         let clock = Self {
@@ -50,6 +55,7 @@ impl MasterClock {
             base_sec: Cell::new(0.0),
             has_audio,
             audio_dead,
+            audio_done,
             latency_samples: Arc::new(AtomicU64::new(0)),
             wall_handover: Cell::new(false),
             paused_nanos: AtomicU64::new(0),
@@ -71,6 +77,9 @@ impl MasterClock {
     // 访问的都是内部可变状态（Cell/原子），无需 &mut，视频线程闭包内可直接调用
     pub fn seek_to(&self, target_sec: f64) {
         self.samples_played.store(0, Ordering::Relaxed);
+        // 设备播放延迟也要清：seek 前的样本已被丢弃，声卡里不再有旧音频，
+        // 留着旧值会让接下来 ~一个 period 的时钟被错误地扣掉这段延迟
+        self.latency_samples.store(0, Ordering::Relaxed);
         self.paused_nanos.store(0, Ordering::Relaxed);
         self.base_sec.set(target_sec);
         self.start_instant.set(Instant::now());
@@ -98,12 +107,17 @@ impl MasterClock {
 
     // 获取声卡当前播放到的绝对时间（秒）
     pub fn get_time_sec(&self) -> f64 {
-        let audio_ok =
-            self.has_audio && self.sample_rate > 0 && !self.audio_dead.load(Ordering::Relaxed);
+        // 采样时钟只在"还有音频样本会到达"时有效：
+        // 音频输出失效（设备坏了）或音频轨播完（EOF 后计数不再前进）时，
+        // 采样时钟会冻结——视频帧全被判为"提前"而不再节流，片尾变成快进。
+        let audio_ok = self.has_audio
+            && self.sample_rate > 0
+            && !self.audio_dead.load(Ordering::Relaxed)
+            && !self.audio_done.load(Ordering::Relaxed);
         if audio_ok {
             self.sample_time()
         } else if self.has_audio && !self.wall_handover.get() {
-            // 音频输出刚失效：以"最后听到的位置"接管墙钟基准。
+            // 音频刚失效/刚播完：以"最后听到的位置"接管墙钟基准。
             // 直接切墙钟会把欠载/停顿累计的时间一次性算进去，时间瞬间前跳，
             // 视频侧会判全体迟到并丢帧/追帧
             let t = self.sample_time();
@@ -134,6 +148,11 @@ impl MasterClock {
         }
         let elapsed = self.last_sample_instant.get().elapsed().as_secs_f64();
         let denom = self.sample_rate as f64 * self.channels as f64;
+        if denom <= 0.0 {
+            // 采样率/声道数为 0（设备配置异常）：没有可用的采样时钟，
+            // 直接用基准值，别把 NaN 传播到整个时间线
+            return self.base_sec.get();
+        }
         let extra = (elapsed * denom).min(denom * 0.050);
         self.base_sec.get() + (raw as f64 + extra) / denom
     }
@@ -143,12 +162,17 @@ impl MasterClock {
 mod tests {
     use super::*;
 
+    // 48kHz 立体声的主时钟；audio_done 单独给出，便于测 EOF 接管
+    fn test_clock(dead: Arc<AtomicBool>) -> (MasterClock, Arc<AtomicU64>) {
+        MasterClock::new(48_000, 2, true, dead, Arc::new(AtomicBool::new(false)))
+    }
+
     // 收尾看门狗依赖 audio_samples 的原始计数：它与 get_time_sec 不同，
     // 在无音频/音频失效时不会退回墙钟；seek 后必须归零
     #[test]
     fn audio_samples_track_and_reset_on_seek() {
         let dead = Arc::new(AtomicBool::new(false));
-        let (clock, samples) = MasterClock::new(48_000, 2, true, dead);
+        let (clock, samples) = test_clock(dead);
         samples.fetch_add(96_000, Ordering::Relaxed); // 1 秒立体声
         assert_eq!(clock.audio_samples(), 96_000);
         assert!((clock.get_time_sec() - 1.0).abs() < 0.01);
@@ -163,7 +187,7 @@ mod tests {
     #[test]
     fn clock_extrapolates_between_callbacks_with_cap() {
         let dead = Arc::new(AtomicBool::new(false));
-        let (clock, samples) = MasterClock::new(48_000, 2, true, dead);
+        let (clock, samples) = test_clock(dead);
         samples.fetch_add(96_000, Ordering::Relaxed); // 1 秒
         let t0 = clock.get_time_sec();
         std::thread::sleep(Duration::from_millis(20));
@@ -179,7 +203,7 @@ mod tests {
     #[test]
     fn playback_latency_shifts_clock_back() {
         let dead = Arc::new(AtomicBool::new(false));
-        let (clock, samples) = MasterClock::new(48_000, 2, true, dead);
+        let (clock, samples) = test_clock(dead);
         samples.fetch_add(96_000, Ordering::Relaxed); // 1 秒已交付
         clock.latency_handle().store(48_000, Ordering::Relaxed); // 0.5 秒仍在缓冲里
         assert!(
@@ -196,7 +220,7 @@ mod tests {
     #[test]
     fn audio_clock_hands_over_to_wall_clock_without_jump() {
         let dead = Arc::new(AtomicBool::new(false));
-        let (clock, samples) = MasterClock::new(48_000, 2, true, dead.clone());
+        let (clock, samples) = test_clock(dead.clone());
         samples.fetch_add(96_000, Ordering::Relaxed); // 1 秒
         assert!((clock.get_time_sec() - 1.0).abs() < 0.06);
 
@@ -216,6 +240,37 @@ mod tests {
         assert!(
             (later - at_switch - 0.03).abs() < 0.04,
             "墙钟只应计入切换后的时间: {later} vs {at_switch}"
+        );
+    }
+
+    // 音频轨正常播完（EOF）：采样计数不再前进，主时钟必须从"最后听到的位置"
+    // 接管墙钟继续走。否则时钟冻结 → 视频帧全被判"提前"且不再节流 → 片尾快进
+    #[test]
+    fn audio_eof_hands_over_to_wall_clock_and_keeps_moving() {
+        let dead = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (clock, samples) = MasterClock::new(48_000, 2, true, dead, done.clone());
+        samples.fetch_add(96_000, Ordering::Relaxed); // 1 秒
+        assert!((clock.get_time_sec() - 1.0).abs() < 0.06);
+
+        // EOF：样本计数停在 1 秒，不再前进
+        done.store(true, Ordering::Relaxed);
+        let at_eof = clock.get_time_sec();
+        assert!(
+            (at_eof - 1.0).abs() < 0.08,
+            "接管瞬间必须停在音频结束位置: {at_eof}"
+        );
+
+        // 之后主时钟必须继续按实时速度前进（否则视频片尾会快进）
+        std::thread::sleep(Duration::from_millis(50));
+        let later = clock.get_time_sec();
+        assert!(
+            later > at_eof,
+            "EOF 后主时钟必须继续走，否则片尾快进: {at_eof} -> {later}"
+        );
+        assert!(
+            (later - at_eof - 0.05).abs() < 0.04,
+            "EOF 后应按墙钟实时前进: {later} vs {at_eof}"
         );
     }
 }

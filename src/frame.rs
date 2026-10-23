@@ -46,6 +46,17 @@ pub enum ChromaLayout {
 
 // 像素数据的来源：CPU 可读平面（软解/swscale 输出），或 GPU 可直接采样的
 // DMA-BUF（VAAPI 零拷贝）。两者共用同一套色彩/显示元数据与 shader。
+// 平面长度是否够读出全部行：stride 必须放得下一行，且缓冲要覆盖到最后一行。
+// 不满足时不能按 stride 切片——那会越界读（UB）或直接 panic。
+// snapshot 跑在 UI 线程的绘制回调里，panic 穿过 FLTK 的 C 边界会 abort 进程，
+// 所以宁可放弃这次截图。
+fn planes_cover_rows(plane_len: usize, stride: usize, rows: usize, row_bytes: usize) -> bool {
+    if stride < row_bytes || rows == 0 {
+        return false;
+    }
+    plane_len >= (rows - 1) * stride + row_bytes
+}
+
 enum FrameBuf {
     Cpu(Box<Video>),
     DmaBuf(Box<DmaBufFrame>),
@@ -333,25 +344,49 @@ impl YuvFrame {
     // 后台线程再读会与解码竞争。拷贝本身只是几次 memcpy（几 MB），
     // 远比在 UI 线程做完整编码可忽略。
     // DMA-BUF 帧没有 CPU 平面，返回 None；调用方改用 GL readback 截图。
+    //
+    // 平面长度/stride 与尺寸对不上时返回 None 而不是 panic：snapshot 跑在
+    // UI 线程的绘制回调里，panic 穿过 FLTK 的 C 边界会直接 abort 整个进程。
+    // 放弃一次截图远好过把播放器搞崩。
     pub fn snapshot(&self) -> Option<FrameSnapshot> {
         let FrameBuf::Cpu(_) = &self.buf else {
             return None;
         };
-        let (u, v, uv_stride) = if self.is_semi_planar() {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        let bps = self.bytes_per_sample();
+        // 负 stride 不能直接转 usize（会变成巨大值让下面的边界计算失真/溢出）
+        if self.y_stride <= 0 || self.uv_stride <= 0 {
+            return None;
+        }
+        let y_stride = self.y_stride as usize;
+        let uv_stride = self.uv_stride as usize;
+        let y = self.y();
+        // 消费方会按 stride 逐行读到最后一行：长度不够就不能给快照。
+        // row_bytes 必须是**字节数**：10bit 一行是 w*2，漏乘 bps 会让
+        // 截断的 10bit 平面通过校验，随后在消费端越界
+        if !planes_cover_rows(y.len(), y_stride, h, w * bps) {
+            return None;
+        }
+        let (u, v, uv_stride_out) = if self.is_semi_planar() {
             // 半平面在 UI 线程拆成 U/V 两份，后台截图代码仍按平面处理。
             // 按行取 uv 平面一次，再逐对拆交错样本（8/10bit 分开写，常量步长
             // 便于向量化；逐像素调 self.uv() + 1 字节 copy 在 4K 下要十几 ms）
-            let cw = (self.width as usize).div_ceil(2);
-            let ch = (self.height as usize).div_ceil(2);
-            let bps = self.bytes_per_sample();
-            let stride = self.uv_stride as usize;
-            let uv = self.uv();
             let row_src = cw * 2 * bps;
             let row_dst = cw * bps;
+            let uv = self.uv();
+            if !planes_cover_rows(uv.len(), uv_stride, ch, row_src) {
+                return None;
+            }
             let mut up = vec![0u8; cw * ch * bps];
             let mut vp = vec![0u8; cw * ch * bps];
             for row in 0..ch {
-                let src = &uv[row * stride..row * stride + row_src];
+                let src = &uv[row * uv_stride..row * uv_stride + row_src];
                 let up_row = &mut up[row * row_dst..(row + 1) * row_dst];
                 let vp_row = &mut vp[row * row_dst..(row + 1) * row_dst];
                 if bps == 1 {
@@ -372,16 +407,23 @@ impl YuvFrame {
             }
             (up, vp, (cw * bps) as i32)
         } else {
-            (self.u().to_vec(), self.v().to_vec(), self.uv_stride)
+            let u = self.u();
+            let v = self.v();
+            if !planes_cover_rows(u.len(), uv_stride, ch, cw * bps)
+                || !planes_cover_rows(v.len(), uv_stride, ch, cw * bps)
+            {
+                return None;
+            }
+            (u.to_vec(), v.to_vec(), self.uv_stride)
         };
         Some(FrameSnapshot {
-            y: self.y().to_vec(),
+            y: y.to_vec(),
             u,
             v,
             width: self.width,
             height: self.height,
             y_stride: self.y_stride,
-            uv_stride,
+            uv_stride: uv_stride_out,
             color_space: self.color_space,
             color_range: self.color_range,
             bit_depth: self.bit_depth,
@@ -504,6 +546,25 @@ mod tests {
             assert_eq!(f.u().len(), f.uv_stride as usize * uv_rows);
             assert_eq!(f.v().len(), f.uv_stride as usize * uv_rows);
         }
+    }
+
+    // 平面长度校验：stride 放不下一行、或缓冲覆盖不到最后一行时必须拒绝，
+    // 否则 snapshot 会越界切片（panic/UB）。snapshot 跑在 UI 线程的绘制回调里，
+    // panic 穿过 FLTK 的 C 边界会直接 abort 整个进程
+    #[test]
+    fn plane_row_coverage_check() {
+        // 正常：stride=64、行宽=64、4 行 → 需要 3*64+64 = 256 字节
+        assert!(planes_cover_rows(256, 64, 4, 64));
+        // 缓冲不足最后一行
+        assert!(!planes_cover_rows(255, 64, 4, 64));
+        // stride 比一行还小（解码器给出损坏的 linesize）
+        assert!(!planes_cover_rows(1024, 32, 4, 64));
+        // 0 行
+        assert!(!planes_cover_rows(0, 64, 0, 64));
+        // 10bit：一行是 w*2 字节。只按 8bit 的长度传 row_bytes 会漏判，
+        // 因此调用方必须传字节数（w*bps / cw*bps）
+        assert!(!planes_cover_rows(3 * 128 + 64, 128, 4, 64 * 2));
+        assert!(planes_cover_rows(3 * 128 + 128, 128, 4, 64 * 2));
     }
 
     // SAR 修正：方形像素原样；变形宽银幕按比例加宽；无效 SAR（分母 0）原样不 panic

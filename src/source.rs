@@ -26,6 +26,9 @@ pub struct SourceStats {
     // cpal 报告的 xrun / 欠载
     pub xruns: AtomicU64,
     pub underruns: AtomicU64,
+    // demux 读错误次数（网络中断/磁盘错误等）。正常播完不算错误。
+    // 没有它就无法把"文件读坏了"和"播放结束"区分开
+    pub read_errors: AtomicU64,
 }
 
 impl SourceStats {
@@ -39,7 +42,7 @@ impl SourceStats {
 
     pub fn summary(&self) -> String {
         format!(
-            "decoded={} displayed={} late_dropped={} catchups={} dmabuf={} xruns={} underruns={} decode_errors={}",
+            "decoded={} displayed={} late_dropped={} catchups={} dmabuf={} xruns={} underruns={} decode_errors={} read_errors={}",
             Self::get(&self.decoded),
             Self::get(&self.displayed),
             Self::get(&self.late_dropped),
@@ -48,6 +51,7 @@ impl SourceStats {
             Self::get(&self.xruns),
             Self::get(&self.underruns),
             Self::get(&self.decode_errors),
+            Self::get(&self.read_errors),
         )
     }
 }

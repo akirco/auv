@@ -163,6 +163,14 @@ struct AudioThread {
     resampled_cap: usize,
 }
 
+// 环缓冲是否已满：必须用**环容量**判定，不能用"已占用样本数 >= 本帧样本数"。
+// 后者在单帧比整个环还长时（FLAC 大块等，单帧可达 1.4s，环只有 500ms）
+// 永远为假 → push_slice 永远返回 0，却既不等待也不推进 offset →
+// 音频线程 100% CPU 空转，且样本永远推不进去（音频彻底卡死）。
+fn ring_is_full(occupied: usize, capacity: usize) -> bool {
+    occupied >= capacity
+}
+
 impl AudioThread {
     fn new(ctx: AudioThreadCtx) -> Result<Self> {
         let AudioThreadCtx {
@@ -303,8 +311,17 @@ impl AudioThread {
                     } else {
                         // 环满：等回调腾出空间。回调只 notify、不持锁，
                         // 实时线程不会被这里的互斥锁阻塞；1ms 超时仅作兜底
+                        //
+                        // 判满必须看**环容量**，不能拿"已占用样本数 >= 本帧样本数"
+                        // 判断：后者在单帧比整个环还长时（FLAC 大块等可达 1.4s）
+                        // 永远为假 → push_slice 永远返回 0，却既不等待也不推进
+                        // offset → 音频线程 100% CPU 空转，且样本永远推不进去。
+                        // 按容量判断后，大帧会被拆成多段分批推入。
                         let guard = self.space.lock.lock().unwrap_or_else(|e| e.into_inner());
-                        if self.producer.occupied_len() >= samples.len() {
+                        if ring_is_full(
+                            self.producer.occupied_len(),
+                            self.producer.capacity().get(),
+                        ) {
                             let _ = self
                                 .space
                                 .cond
@@ -374,6 +391,13 @@ impl AudioThread {
         let mut dead = false;
         // 复用的解码输出帧（见下方 receive_frame 处注释）
         let mut decoded = ffmpeg_next::util::frame::Audio::empty();
+        // 待重试的包：send_packet 返回 EAGAIN 表示解码器**没有接收**这个包
+        // （输入缓冲满），必须原样重试；直接丢掉等于丢音频（爆音/断音）。
+        // 取帧（receive_frame）腾出解码器内部空间后就能收下。
+        let mut pending: Option<TimedPacket> = None;
+        // EOF 标记同样可能因 EAGAIN 没被接受：必须重试，否则解码器里
+        // 残留的帧永远取不出来，片尾会缺一截音频
+        let mut pending_eof = false;
         while !eof && !dead {
             // 本源收尾：不再解码/等待，直接进入收尾路径
             if self.shared.stop.load(Ordering::Relaxed) {
@@ -384,7 +408,13 @@ impl AudioThread {
             if let Some(decision) = self.shared.ctl.snapshot_decision(self.local_epoch) {
                 self.local_epoch = decision.epoch;
                 match decision.outcome {
-                    SeekOutcome::Reset => self.handle_seek(decision.epoch)?,
+                    SeekOutcome::Reset => {
+                        self.handle_seek(decision.epoch)?;
+                        // 复位后解码器已 flush，seek 前的包不能再发出去。
+                        // Failed 分支没有 flush、读位置也没变，pending 包仍有效
+                        pending = None;
+                        pending_eof = false;
+                    }
                     // 定位失败：读位置没变，音频解码器必须保持现状。
                     // 此时 flush/清环会丢掉正在播的音频并重置采样计数，
                     // 主时钟会瞬间错位
@@ -404,39 +434,79 @@ impl AudioThread {
             }
             // 有界超时接收：留出每 10ms 检查一次 seek 的机会，避免 seek 时
             // demux 阻塞在就绪屏障上而本线程阻塞在 recv 造成的死锁
-            match self.audio_rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(tp) => {
-                    // 与视频同理：丢弃复位后才送达的 seek 前旧包；
-                    // 定位失败时门槛不抬高，这些包仍对应当前读位置
-                    if tp.epoch < self.packet_epoch_floor {
-                        continue;
+            //
+            // 先重试上一轮没发出去的包/EOF，再收新包。EAGAIN 表示解码器
+            // 输入缓冲满了，这轮不能收新包（否则新包也会被拒，白丢一个）。
+            let mut blocked = false;
+            if pending_eof {
+                match self.decoder.send_eof() {
+                    Ok(()) => {
+                        pending_eof = false;
+                        eof = true;
                     }
-                    let sent = self.decoder.send_packet(&tp.packet);
-                    if let Err(e) = sent
-                        && !is_backpressure(&e)
-                    {
+                    Err(e) if is_backpressure(&e) => blocked = true,
+                    Err(e) => {
+                        self.note_decode_error("send_eof", &e);
+                        pending_eof = false;
+                        eof = true;
+                    }
+                }
+            } else if let Some(tp) = pending.take() {
+                match self.decoder.send_packet(&tp.packet) {
+                    Ok(()) => {}
+                    Err(e) if is_backpressure(&e) => {
+                        pending = Some(tp);
+                        blocked = true;
+                    }
+                    Err(e) => {
                         self.note_decode_error("send_packet", &e);
                     }
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let sent = self.decoder.send_eof();
-                    if let Err(e) = sent
-                        && !is_backpressure(&e)
-                    {
-                        self.note_decode_error("send_eof", &e);
+            }
+            if !blocked && !eof {
+                match self.audio_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(tp) => {
+                        // 与视频同理：丢弃复位后才送达的 seek 前旧包；
+                        // 定位失败时门槛不抬高，这些包仍对应当前读位置
+                        if tp.epoch < self.packet_epoch_floor {
+                            continue;
+                        }
+                        match self.decoder.send_packet(&tp.packet) {
+                            Ok(()) => {}
+                            Err(e) if is_backpressure(&e) => {
+                                pending = Some(tp);
+                            }
+                            Err(e) => {
+                                self.note_decode_error("send_packet", &e);
+                            }
+                        }
                     }
-                    eof = true;
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // 通道断开：给解码器送 EOF 冲掉残留帧。EOF 也可能
+                        // 因 EAGAIN 被拒，记下待重试。
+                        match self.decoder.send_eof() {
+                            Ok(()) => eof = true,
+                            Err(e) if is_backpressure(&e) => pending_eof = true,
+                            Err(e) => {
+                                self.note_decode_error("send_eof", &e);
+                                eof = true;
+                            }
+                        }
+                    }
                 }
             }
             // 复用的解码输出帧：receive_frame 内部先 unref 再重填，跨 packet
             // 复用安全（原先每个 packet 新建一个 AVFrame）。它只作为重采样器
             // 的输入，run 期间数据即被拷走，不跨迭代持有引用。
             // EAGAIN（暂无更多帧）与 EOF 是正常收尾，其余错误计数并记一条日志
+            let mut drained = false;
             loop {
                 let received = self.decoder.receive_frame(&mut decoded);
                 match received {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        drained = true;
+                    }
                     Err(e) if is_backpressure(&e) => break,
                     Err(ffmpeg_next::Error::Eof) => break,
                     Err(e) => {
@@ -444,8 +514,17 @@ impl AudioThread {
                         break;
                     }
                 }
+                // 输出容量必须覆盖"本帧转换结果 + 重采样器内部滞留的样本"：
+                // 只按比例算会漏掉 swr_get_delay 那部分，缓冲偏小 →
+                // swr_convert_frame 返回 ENOSPC → 整帧音频被丢掉，
+                // 表现为音频慢慢落后于视频（永久 A/V 漂移）且日志全干净
+                let delay_out = self
+                    .resampler
+                    .delay()
+                    .map_or(0usize, |d| d.output.max(0) as usize);
                 let out_cap = (decoded.samples() as f64 * self.sample_rate as f64 / self.src_rate)
                     .ceil() as usize
+                    + delay_out
                     + 1;
                 // 注意：ffmpeg-next 的 Audio::alloc 对已持有缓冲的帧会静默失败
                 // （av_frame_get_buffer 返回 EINVAL 被忽略），必须丢弃旧帧换新帧，
@@ -457,11 +536,24 @@ impl AudioThread {
                     self.resampled_cap = out_cap;
                 }
                 self.resampled.set_samples(self.resampled_cap);
-                if self.resampler.run(&decoded, &mut self.resampled).is_ok() && !self.push_samples()
-                {
+                // 重采样失败必须报错：吞掉它等于静默丢样本，
+                // 表现为音频慢慢落后于视频（永久 A/V 漂移）且日志/统计全干净
+                match self.resampler.run(&decoded, &mut self.resampled) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.note_decode_error("resample", &e);
+                        break;
+                    }
+                }
+                if !self.push_samples() {
                     dead = true;
                     break;
                 }
+            }
+            // 解码器还是塞不下、这轮一帧也没取出来：歇一下再重试，
+            // 否则会变成"重试→取不到帧→重试"的 100% CPU 空转
+            if blocked && !drained {
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
 
@@ -699,4 +791,31 @@ pub fn build_output_stream(
     )?;
     stream.play()?;
     Ok((stream, producer, space))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ring_is_full;
+
+    // 环满判定必须看环容量。
+    // 曾经用"已占用样本数 >= 本帧样本数"判定：单帧比整个环还长时
+    // （FLAC 大块可达 1.4s，环只有 500ms）该条件永远为假 →
+    // push_slice 永远返回 0，却既不等待也不推进 offset →
+    // 音频线程 100% CPU 空转、样本永远推不进去。
+    #[test]
+    fn ring_full_uses_capacity_not_frame_length() {
+        const CAP: usize = 16;
+        // 环满：必须判为满（这样才会去等回调腾空间）
+        assert!(ring_is_full(CAP, CAP));
+        // 还有空间：不能判为满（否则会白等 1ms）
+        assert!(!ring_is_full(CAP - 1, CAP));
+
+        // 回归点：单帧比环还长时，用帧长判定会漏判
+        let frame_len = CAP * 2;
+        assert!(
+            !(CAP >= frame_len),
+            "旧判定（帧长）在此处漏判，正是空转的根因"
+        );
+        assert!(ring_is_full(CAP, CAP), "按容量判定则能正确识别环满");
+    }
 }

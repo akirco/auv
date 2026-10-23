@@ -283,12 +283,16 @@ impl EglInterop {
 
     // 把 EGLImage 绑定为 texture 的存储（替换原有存储）。
     ///
+    /// `unit` 是目标纹理单元：BindTexture 作用于**当前活动单元**，
+    /// 不显式切换就会把纹理绑到调用方遗留的活动单元上（顶掉别的纹理绑定）。
+    ///
     /// # Safety
     /// `image` 必须有效，且调用线程持有创建该 image 的 EGL/GL 上下文。
-    pub unsafe fn bind_image(&self, texture: u32, image: EGLImage) -> bool {
+    pub unsafe fn bind_image(&self, unit: u32, texture: u32, image: EGLImage) -> bool {
         unsafe {
             // 清掉之前探测扩展等操作可能留下的错误，避免误判下面的调用
             while gl::GetError() != gl::NO_ERROR {}
+            gl::ActiveTexture(gl::TEXTURE0 + unit);
             gl::BindTexture(gl::TEXTURE_2D, texture);
             (self.image_target_texture)(gl::TEXTURE_2D, image);
             let err = gl::GetError();

@@ -169,6 +169,9 @@ struct VideoThread {
     scaler10: Option<(ScaleContext, (Pixel, u32, u32))>,
     // HDR(PQ/HLG) → SDR 的滤镜图，惰性创建、按输入特征缓存
     tonemapper: Tonemapper,
+    // 转换输出帧池：swscale 输出帧的所有权要交给下游（显示/零拷贝），
+    // UI 回收帧后归还到这里，下一轮直接复用 → 避免每帧一次整帧缓冲分配
+    conv_pool: Vec<ffmpeg_next::util::frame::video::Video>,
     // 调试/兜底：AUV_CPU_TONEMAP=1 时强制走原 CPU tone map，便于对比 GPU 输出
     force_cpu_tonemap: bool,
     // PTS 缺失（rawvideo 等）时的单调回退：按上帧 +1 个 time_base 步进；
@@ -233,6 +236,7 @@ impl VideoThread {
             scaler: None,
             scaler10: None,
             tonemapper: Tonemapper::new(),
+            conv_pool: Vec::new(),
             force_cpu_tonemap: std::env::var_os("AUV_CPU_TONEMAP").is_some_and(|v| v != "0"),
             last_pts: None,
             local_epoch: 0,
@@ -363,6 +367,13 @@ impl VideoThread {
         // 复用的接收目标帧：avcodec_receive_frame 内部先 unref 再重填，
         // 因此跨 packet 复用是安全的（原先每个 packet 新建一个 AVFrame）
         let mut target = self.take_recycled();
+        // 待重试的包：send_packet 返回 EAGAIN 表示解码器**没有接收**这个包
+        // （输入缓冲满），必须原样重试；直接丢掉等于丢帧（花屏/画面缺块）。
+        // 取帧（receive_frame）腾出解码器内部空间后就能收下。
+        let mut pending: Option<TimedPacket> = None;
+        // EOF 标记同样可能因 EAGAIN 没被接受：必须重试，否则解码器里
+        // 残留的帧（B 帧延迟等）永远取不出来，片尾会缺一截
+        let mut pending_eof = false;
         while !eof {
             // 本源收尾（播完/关窗/异常）：尽快退出解码循环
             if self.shared.stop.load(Ordering::Relaxed) {
@@ -373,7 +384,14 @@ impl VideoThread {
             if let Some(decision) = self.shared.ctl.snapshot_decision(self.local_epoch) {
                 self.local_epoch = decision.epoch;
                 match decision.outcome {
-                    SeekOutcome::Reset => self.reset_for_seek(decision.target),
+                    SeekOutcome::Reset => {
+                        self.reset_for_seek(decision.target);
+                        // 复位后解码器已 flush，seek 前的包不能再发出去。
+                        // Failed 分支没有 flush、读位置也没变，pending 包仍有效，
+                        // 丢掉等于丢一帧（视频还会连带后续参考帧花屏）
+                        pending = None;
+                        pending_eof = false;
+                    }
                     // 定位失败：读位置没有变化，解码器必须保持现状。
                     // 此时 flush 会清空参考帧，之后每帧都解不出来（画面直接坏掉）
                     SeekOutcome::Failed => {
@@ -384,39 +402,80 @@ impl VideoThread {
             }
             // 有界超时接收：留出每 10ms 检查一次 seek 的机会，避免 seek 时
             // demux 阻塞在就绪屏障上而本线程阻塞在 recv 造成的死锁
-            match self.video_rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(tp) => {
-                    // seek 前读出的旧包在复位后才送达：按代数丢弃。
-                    // 定位失败时门槛不抬高，这些包仍然对应当前读位置，必须保留
-                    if tp.epoch < self.packet_epoch_floor {
-                        continue;
+            //
+            // 先重试上一轮没发出去的包/EOF，再收新包。EAGAIN 说明解码器
+            // 输入缓冲满了，这轮不能收新包（否则新包也会被拒，白丢一个）。
+            let mut blocked = false;
+            if pending_eof {
+                match self.decoder.as_mut().unwrap().send_eof() {
+                    Ok(()) => {
+                        pending_eof = false;
+                        eof = true;
                     }
-                    let sent = self.decoder.as_mut().unwrap().send_packet(&tp.packet);
-                    if let Err(e) = sent
-                        && !is_backpressure(&e)
-                    {
+                    Err(e) if is_backpressure(&e) => blocked = true,
+                    Err(e) => {
+                        self.note_decode_error("send_eof", &e);
+                        pending_eof = false;
+                        eof = true;
+                    }
+                }
+            } else if let Some(tp) = pending.take() {
+                match self.decoder.as_mut().unwrap().send_packet(&tp.packet) {
+                    Ok(()) => {}
+                    Err(e) if is_backpressure(&e) => {
+                        pending = Some(tp);
+                        blocked = true;
+                    }
+                    Err(e) => {
                         self.note_decode_error("send_packet", &e);
                     }
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let sent = self.decoder.as_mut().unwrap().send_eof();
-                    if let Err(e) = sent
-                        && !is_backpressure(&e)
-                    {
-                        self.note_decode_error("send_eof", &e);
+            }
+            if !blocked && !eof {
+                match self.video_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(tp) => {
+                        // seek 前读出的旧包在复位后才送达：按代数丢弃。
+                        // 定位失败时门槛不抬高，这些包仍然对应当前读位置，必须保留
+                        if tp.epoch < self.packet_epoch_floor {
+                            continue;
+                        }
+                        match self.decoder.as_mut().unwrap().send_packet(&tp.packet) {
+                            Ok(()) => {}
+                            Err(e) if is_backpressure(&e) => {
+                                pending = Some(tp);
+                            }
+                            Err(e) => {
+                                self.note_decode_error("send_packet", &e);
+                            }
+                        }
                     }
-                    eof = true;
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // 通道断开：给解码器送 EOF 冲掉残留帧。EOF 也可能
+                        // 因 EAGAIN 被拒，记下待重试。
+                        match self.decoder.as_mut().unwrap().send_eof() {
+                            Ok(()) => eof = true,
+                            Err(e) if is_backpressure(&e) => pending_eof = true,
+                            Err(e) => {
+                                self.note_decode_error("send_eof", &e);
+                                eof = true;
+                            }
+                        }
+                    }
                 }
             }
             // EAGAIN（本轮没有更多帧）与 EOF 都是正常收尾，不能算解码错误；
             // 其余错误（InvalidData / External 等）计数并留一条日志。
             // process_frame 发布成功时会把 target 的像素所有权移进 YuvFrame
             // 并补上一个新的目标帧（回收来的或新建的）
+            let mut drained = false;
             loop {
                 let received = self.decoder.as_mut().unwrap().receive_frame(&mut target);
                 match received {
-                    Ok(()) => self.process_frame(&mut target),
+                    Ok(()) => {
+                        drained = true;
+                        self.process_frame(&mut target);
+                    }
                     Err(e) if is_backpressure(&e) => break,
                     Err(ffmpeg_next::Error::Eof) => break,
                     Err(e) => {
@@ -424,6 +483,11 @@ impl VideoThread {
                         break;
                     }
                 }
+            }
+            // 解码器还是塞不下、这轮一帧也没取出来：歇一下再重试。
+            // 否则会变成"重试→取不到帧→重试"的 100% CPU 空转
+            if blocked && !drained {
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
         Ok(())
@@ -452,6 +516,52 @@ impl VideoThread {
                 .map_or_else(ffmpeg_next::util::frame::video::Video::empty, |b| *b),
             Err(_) => ffmpeg_next::util::frame::video::Video::empty(),
         }
+    }
+
+    // 取回 UI 回收的帧（保留 Box 所有权，用于放回转换输出池）
+    fn take_recycled_box(&mut self) -> Option<Box<ffmpeg_next::util::frame::video::Video>> {
+        match self.recycle_rx.try_recv() {
+            Ok(f) => f.into_buf(),
+            Err(_) => None,
+        }
+    }
+
+    // 安排下一轮的目标帧：
+    // - 直接上屏：解码帧的像素所有权已经交给 UI，target 必须换新的
+    // - 转换路径：解码帧只是中间结果，仍留在 target 里，下一轮解码器直接
+    //   重填（avcodec_receive_frame 先 unref 再填 → 缓冲被复用，没有整帧
+    //   分配）；UI 回收回来的正是上一帧的转换输出，放回输出池复用
+    fn next_target(
+        &mut self,
+        target: &mut ffmpeg_next::util::frame::video::Video,
+        decoded_kept: bool,
+    ) {
+        if decoded_kept {
+            if let Some(recycled) = self.take_recycled_box() {
+                self.conv_pool.push(*recycled);
+            }
+        } else {
+            *target = self.take_recycled();
+        }
+    }
+
+    // 取一个可复用的转换输出帧。格式/尺寸必须与目标一致：swscale 按输出帧
+    // 自己的 linesize 写入，尺寸不符就是越界写。池里的帧尺寸变了就丢弃。
+    fn take_conv_dst(
+        pool: &mut Vec<ffmpeg_next::util::frame::video::Video>,
+        format: Pixel,
+        w: u32,
+        h: u32,
+    ) -> ffmpeg_next::util::frame::video::Video {
+        while let Some(cand) = pool.pop() {
+            if cand.format() == format && cand.width() == w && cand.height() == h {
+                return cand;
+            }
+            // 尺寸/格式变了：不能当输出缓冲用，丢弃
+        }
+        let mut dst = ffmpeg_next::util::frame::video::Video::empty();
+        unsafe { dst.alloc(format, w, h) };
+        dst
     }
 
     // seek 的本地复位：flush 解码器、排空通道、清 PTS 回退、置首帧标记，
@@ -568,6 +678,7 @@ impl VideoThread {
             if self.late_pressure == 0 {
                 self.set_decoder_skip(false);
             }
+            let mut last_now = f64::NEG_INFINITY;
             loop {
                 // 等待期间若出现新 seek，立即放弃本帧：音频线程的复位会把
                 // 主时钟拨回（samples 清零），若不检查会在此永久空转，
@@ -579,13 +690,19 @@ impl VideoThread {
                 if now >= video_pts_sec {
                     break;
                 }
-                // 音频已经播完（含解码线程异常退出）：采样计数不会再前进，
-                // 等一个永远到不了的时间点会把整个源挂死。片尾视频比音频长
-                // 几毫秒、或音频包损坏丢了一小段时都会必现——直接显示本帧，
-                // 让解码循环尽快走到 EOF 收尾
-                if self.has_audio && self.shared.audio_done.load(Ordering::Relaxed) {
+                // 音频已经播完（含解码线程异常退出）：采样计数不会再前进。
+                // 主时钟此时已接管墙钟（见 MasterClock::get_time_sec），时间照常
+                // 前进，节流照常进行——不能在这里无条件退出，否则剩余视频帧
+                // 会以解码速度一次性放出，片尾变成快进。
+                // 只有时钟确实不再前进（异常路径没能接管）时才放弃等待，
+                // 否则会等一个永远到不了的时间点，把整个源挂死。
+                if self.has_audio
+                    && self.shared.audio_done.load(Ordering::Relaxed)
+                    && now <= last_now
+                {
                     break;
                 }
+                last_now = now;
                 let remain = video_pts_sec - now;
                 let nap = if remain > 0.008 {
                     (remain - 0.003).min(0.050)
@@ -766,7 +883,13 @@ impl VideoThread {
             target.format() == Pixel::NV12 && linesize(target, 0) > 0 && linesize(target, 1) > 0;
         let ready_p010 =
             target.format() == Pixel::P010LE && linesize(target, 0) > 0 && linesize(target, 1) > 0;
-        let owned = std::mem::replace(target, ffmpeg_next::util::frame::video::Video::empty());
+        // 直接上屏的格式要把解码帧的像素所有权交给下游（move 出去）；
+        // 需要转换的格式只借用它——解码帧留在 target 里，下一轮由解码器
+        // 重填（avcodec_receive_frame 先 unref 再填，缓冲被复用），
+        // 稳态下没有整帧缓冲分配
+        let take_owned = |target: &mut ffmpeg_next::util::frame::video::Video| {
+            std::mem::replace(target, ffmpeg_next::util::frame::video::Video::empty())
+        };
         // (buf, layout, bit_depth, space, range, transfer, primaries)
         type Converted = (
             Box<ffmpeg_next::util::frame::video::Video>,
@@ -778,7 +901,7 @@ impl VideoThread {
             Primaries,
         );
         let converted: Option<Converted> = if is_hdr && self.force_cpu_tonemap {
-            self.tonemapper.convert(&owned, self.time_base).map(|b| {
+            self.tonemapper.convert(target, self.time_base).map(|b| {
                 (
                     Box::new(b),
                     ChromaLayout::Planar,
@@ -792,7 +915,7 @@ impl VideoThread {
         } else if is_hdr {
             if ready_p010 {
                 Some((
-                    Box::new(owned),
+                    Box::new(take_owned(target)),
                     ChromaLayout::SemiPlanar,
                     10,
                     color_space,
@@ -803,7 +926,7 @@ impl VideoThread {
             } else if ready_10 {
                 // HDR10/HLG 10bit 平面：零拷贝交给 GPU tone map
                 Some((
-                    Box::new(owned),
+                    Box::new(take_owned(target)),
                     ChromaLayout::Planar,
                     10,
                     color_space,
@@ -814,7 +937,7 @@ impl VideoThread {
             } else if ready_nv12 {
                 // 8bit HDR 极少见，但 shader 同样能处理
                 Some((
-                    Box::new(owned),
+                    Box::new(take_owned(target)),
                     ChromaLayout::SemiPlanar,
                     8,
                     color_space,
@@ -824,7 +947,7 @@ impl VideoThread {
                 ))
             } else if ready_420p {
                 Some((
-                    Box::new(owned),
+                    Box::new(take_owned(target)),
                     ChromaLayout::Planar,
                     8,
                     color_space,
@@ -832,7 +955,7 @@ impl VideoThread {
                     transfer,
                     primaries,
                 ))
-            } else if let Some(b) = self.scale_to_420p10(&owned) {
+            } else if let Some(b) = self.scale_to_420p10(target) {
                 Some((
                     b,
                     ChromaLayout::Planar,
@@ -845,7 +968,7 @@ impl VideoThread {
             } else {
                 // 10bit 转换失败：退回原有 CPU tone map（颜色正确但更慢）
                 warn!("HDR 10bit conversion failed, falling back to CPU tone mapping");
-                self.tonemapper.convert(&owned, self.time_base).map(|b| {
+                self.tonemapper.convert(target, self.time_base).map(|b| {
                     (
                         Box::new(b),
                         ChromaLayout::Planar,
@@ -860,7 +983,7 @@ impl VideoThread {
         } else if ready_p010 {
             // 10bit SDR（NV12/P010 常见于硬解）：保留位深，不 tone map
             Some((
-                Box::new(owned),
+                Box::new(take_owned(target)),
                 ChromaLayout::SemiPlanar,
                 10,
                 color_space,
@@ -870,7 +993,7 @@ impl VideoThread {
             ))
         } else if ready_nv12 {
             Some((
-                Box::new(owned),
+                Box::new(take_owned(target)),
                 ChromaLayout::SemiPlanar,
                 8,
                 color_space,
@@ -881,7 +1004,7 @@ impl VideoThread {
         } else if ready_10 {
             // 10bit SDR 平面：保留位深
             Some((
-                Box::new(owned),
+                Box::new(take_owned(target)),
                 ChromaLayout::Planar,
                 10,
                 color_space,
@@ -891,7 +1014,7 @@ impl VideoThread {
             ))
         } else if ready_420p {
             Some((
-                Box::new(owned),
+                Box::new(take_owned(target)),
                 ChromaLayout::Planar,
                 8,
                 color_space,
@@ -900,7 +1023,7 @@ impl VideoThread {
                 Primaries::Unspecified,
             ))
         } else {
-            self.scale_to_420p(&owned).map(|b| {
+            self.scale_to_420p(target).map(|b| {
                 (
                     b,
                     ChromaLayout::Planar,
@@ -912,11 +1035,13 @@ impl VideoThread {
                 )
             })
         };
+        // 转换路径下解码帧没有被 move 出去，仍在 target 里 → 下一轮可复用
+        let decoded_kept = !unsafe { target.is_empty() };
         let Some((buf, layout, bit_depth, out_space, out_range, out_transfer, out_primaries)) =
             converted
         else {
             // 转换失败只跳过本帧，不让解码线程挂掉导致播放卡死
-            *target = self.take_recycled();
+            self.next_target(target, decoded_kept);
             return;
         };
 
@@ -964,9 +1089,9 @@ impl VideoThread {
         // 有界通道：UI 停顿时在此阻塞形成背压，防止帧无限堆积；
         // 发送后手动唤醒 fltk 事件循环
         let sent = self.tx.send(Message::Frame(frame_data)).is_ok();
-        // 为下一轮 receive_frame 补一个目标帧：UI 渲染完会把旧帧回收回来，
-        // 稳态下走回收路径，既不分配 AVFrame 也保留其像素缓冲
-        *target = self.take_recycled();
+        // 安排下一轮的目标帧（直接上屏换新帧 / 转换路径复用解码帧，
+        // 回收帧进转换输出池）
+        self.next_target(target, decoded_kept);
         if sent {
             self.shared.stats.displayed.fetch_add(1, Ordering::Relaxed);
             app::awake();
@@ -997,7 +1122,7 @@ impl VideoThread {
                 }
             }
         }
-        let mut dst = ffmpeg_next::util::frame::video::Video::empty();
+        let mut dst = Self::take_conv_dst(&mut self.conv_pool, Pixel::YUV420P10LE, key.1, key.2);
         let (ctx, _) = self.scaler10.as_mut().unwrap();
         if ctx.run(src, &mut dst).is_err() {
             return None;
@@ -1029,9 +1154,9 @@ impl VideoThread {
                 }
             }
         }
-        // 输出帧每次新建：它的所有权要交给下游（零拷贝），不能像以前那样
-        // 复用 self.conv。仅非 420P / 负 stride 的少数流走这条路径
-        let mut dst = ffmpeg_next::util::frame::video::Video::empty();
+        // 输出帧从池里取：它的所有权要交给下游（零拷贝），所以不能就地复用，
+        // 只能靠 UI 回收后归还。仅非 420P / 负 stride 的少数流走这条路径
+        let mut dst = Self::take_conv_dst(&mut self.conv_pool, Pixel::YUV420P, key.1, key.2);
         let (ctx, _) = self.scaler.as_mut().unwrap();
         if ctx.run(src, &mut dst).is_err() {
             return None;
@@ -1401,6 +1526,43 @@ impl Tonemapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 转换输出帧池：格式/尺寸必须匹配才能复用。
+    // 尺寸不符的帧绝不能当输出缓冲——swscale 按输出帧自己的 linesize 写入，
+    // 尺寸不符就是越界写（堆损坏）
+    #[test]
+    fn conv_dst_pool_rejects_mismatched_frames() {
+        let mut pool: Vec<ffmpeg_next::util::frame::video::Video> = Vec::new();
+        // 池里放一个尺寸不同的帧
+        let mut wrong = ffmpeg_next::util::frame::video::Video::empty();
+        unsafe { wrong.alloc(Pixel::YUV420P, 32, 32) };
+        pool.push(wrong);
+
+        // 取 64x48 的输出：尺寸不符的帧被丢弃，另分配一个
+        let dst = VideoThread::take_conv_dst(&mut pool, Pixel::YUV420P, 64, 48);
+        assert!(pool.is_empty(), "尺寸不符的帧必须从池里丢掉");
+        assert_eq!(dst.format(), Pixel::YUV420P);
+        assert_eq!((dst.width(), dst.height()), (64, 48));
+        assert!(linesize(&dst, 0) > 0, "输出帧必须已分配缓冲");
+
+        // 再取一个：池空 → 新分配
+        let dst2 = VideoThread::take_conv_dst(&mut pool, Pixel::YUV420P, 64, 48);
+        assert_eq!((dst2.width(), dst2.height()), (64, 48));
+
+        // 尺寸/格式都对得上 → 直接复用池里的帧
+        let mut pool2: Vec<ffmpeg_next::util::frame::video::Video> = Vec::new();
+        let mut ok = ffmpeg_next::util::frame::video::Video::empty();
+        unsafe { ok.alloc(Pixel::YUV420P, 64, 48) };
+        let ok_ptr = unsafe { ok.as_ptr() };
+        pool2.push(ok);
+        let reused = VideoThread::take_conv_dst(&mut pool2, Pixel::YUV420P, 64, 48);
+        assert!(pool2.is_empty());
+        assert_eq!(
+            unsafe { reused.as_ptr() },
+            ok_ptr,
+            "尺寸匹配时必须复用池里的帧"
+        );
+    }
 
     // 真实跑一遍 HDR tone mapping：构造一张 PQ/BT.2020 的 10bit 帧，
     // 走滤镜图后应得到同尺寸的 SDR YUV420P。依赖 ffmpeg 的 zscale/tonemap

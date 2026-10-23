@@ -170,12 +170,16 @@ impl SourceSession {
         // 纯视频源若被当成有音频，采样计数永不推进，主时钟停在 0，视频会卡死首帧。
         // audio_dead：音频输出失效标记，主时钟回退墙钟、音频线程中止
         let audio_dead = Arc::new(AtomicBool::new(false));
+        // audio_done：音频轨播完（含环缓冲排空）。主时钟据此回退墙钟：
+        // EOF 后采样计数不再前进，继续用采样时钟会让时钟冻结、片尾快进
+        let audio_done = Arc::new(AtomicBool::new(false));
         let has_audio = self.audio_config.is_some() && audio_index.is_some();
         let (master_clock, samples_played_arc) = MasterClock::new(
             self.audio_rate,
             self.audio_channels,
             has_audio,
             audio_dead.clone(),
+            audio_done.clone(),
         );
         // 设备播放延迟由 cpal 回调写入，主时钟用它扣掉"已交付但还没出声"的样本
         let latency_arc = master_clock.latency_handle();
@@ -296,9 +300,9 @@ impl SourceSession {
             stop: stop.clone(),
             watchdog: self.watchdog.take(),
             paused: self.paused.clone(),
+            stats: Some(stats.clone()),
         }));
 
-        let audio_done = Arc::new(AtomicBool::new(false));
         let sync = Arc::new((Mutex::new(()), Condvar::new()));
         if !has_audio_thread {
             audio_done.store(true, Ordering::Relaxed);

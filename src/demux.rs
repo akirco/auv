@@ -3,12 +3,14 @@ use ffmpeg_next::{codec, codec::packet::Packet, format, media};
 use log::{info, warn};
 
 use crate::pause::PauseGate;
+use crate::source::SourceStats;
 use crate::util::ReadWatchdog;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::SyncSender,
 };
+use std::time::Instant;
 
 // 带 seek 代数的 packet：demux 在读取时打上当前代数，解码线程在本地复位后
 // 丢弃"seek 前已读出、但在复位后才送达"的旧 packet。没有这个标记时，
@@ -104,6 +106,14 @@ struct SeekState {
     decided_target: Option<f64>,
 }
 
+// 就绪屏障的等待上限：解码线程异常退出时不能让 demux 永久挂着
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+// 连续多少个坏包后放弃本源。demuxer 通常能从 AVERROR_INVALIDDATA 重新同步，
+// 但若某个输入持续返回它，`continue` 会变成 100% CPU 空转，而且每轮都会
+// 刷新看门狗，异常永远暴露不出来
+const MAX_INVALID_STREAK: u32 = 100;
+
 impl SeekCtl {
     /// ready_max：需要就绪的解码线程数（视频线程 1 + 有音频输出时的音频线程 1）
     pub fn new(ready_max: usize) -> Self {
@@ -177,6 +187,11 @@ impl SeekCtl {
     /// 解码线程在本地复位完成后回报就绪。新代数会重置计数再累加
     pub fn report_ready(&self, epoch: u64) {
         let mut g = self.ready.lock().unwrap();
+        // 过期代数的回报直接忽略：否则 g.epoch 会被拉回旧值，
+        // demux 等待的那个代数再也等不到（就绪屏障永久卡死）
+        if epoch < g.epoch {
+            return;
+        }
         if g.epoch != epoch {
             g.epoch = epoch;
             g.count = 0;
@@ -232,15 +247,44 @@ impl SeekCtl {
     pub fn abandon_decoder(&self) {
         let mut g = self.ready.lock().unwrap();
         g.needed = g.needed.saturating_sub(1);
+        // 退出的线程不会再 report_ready：把就绪代数推进到当前 seek 代数，
+        // 否则 demux 等待的代数永远等不到（屏障卡死）
+        let cur = self.epoch();
+        if g.epoch < cur {
+            g.epoch = cur;
+            g.count = 0;
+        }
         self.ready_cond.notify_all();
     }
 
     /// demux 等待所有解码线程就绪到"至少该代数"。若期间出现更新代数的完整就绪
-    /// （如连续快速 seek），同样满足条件，demux 不会永久等待
-    pub fn wait_ready(&self, epoch: u64) {
+    /// （如连续快速 seek），同样满足条件，demux 不会永久等待。
+    ///
+    /// 带超时：解码线程异常退出、或就绪代数被回退时，等待可能永远不满足。
+    /// 那种情况下必须让 demux 带着"未就绪"继续（宁可多发几个包），
+    /// 而不是把整个源挂死。返回 false 表示超时。
+    pub fn wait_ready(&self, epoch: u64) -> bool {
+        self.wait_ready_timeout(epoch, READY_TIMEOUT)
+    }
+
+    /// 同上，但等待上限可指定（测试用短超时，避免拖慢测试套件）
+    pub fn wait_ready_timeout(&self, epoch: u64, timeout: std::time::Duration) -> bool {
+        let deadline = Instant::now() + timeout;
         let mut g = self.ready.lock().unwrap();
-        while !(g.epoch >= epoch && g.count >= g.needed) {
-            g = self.ready_cond.wait(g).unwrap();
+        loop {
+            if g.epoch >= epoch && g.count >= g.needed {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                warn!(
+                    "seek barrier timed out at epoch {epoch} (ready {}/{}, barrier epoch {})",
+                    g.count, g.needed, g.epoch
+                );
+                return false;
+            }
+            let (ng, _) = self.ready_cond.wait_timeout(g, deadline - now).unwrap();
+            g = ng;
         }
     }
 }
@@ -260,6 +304,8 @@ pub struct DemuxCtx {
     // 暂停门：发布 seek 处理结果后要唤醒暂停中的解码线程，
     // 否则它们会一直挂在暂停等待里看不到新结果
     pub paused: Arc<PauseGate>,
+    // 统计计数器：用于把"读错误"和"正常播完"区分开
+    pub stats: Option<Arc<SourceStats>>,
 }
 
 // 解复用线程：统一读取媒体 packet，按流类型分发给视频/音频解码线程。
@@ -284,6 +330,7 @@ pub fn spawn_demux_thread(ctx: DemuxCtx) -> std::thread::JoinHandle<()> {
         stop,
         watchdog,
         paused,
+        stats,
     } = ctx;
     std::thread::spawn(move || {
         let mut seen = 0u64;
@@ -292,10 +339,14 @@ pub fn spawn_demux_thread(ctx: DemuxCtx) -> std::thread::JoinHandle<()> {
             if stop.load(Ordering::Relaxed) {
                 break 'source;
             }
-            // 用带标签的块把 packets 迭代器的只读借用限制在块内：
+            // 用带标签的块把 ictx 的 &mut 借用限制在块内：
             // 块结束后才能 &mut ictx 做 seek。块结果 Some((epoch, target)) 表示要 seek
             let seek_req = 'read: {
-                let mut iter = ictx.packets();
+                // 直接驱动 av_read_frame（而不是用 packets() 迭代器）：
+                // 迭代器把**读错误和 EOF 一起**返回 None，网络中断/文件损坏
+                // 会被当成"播放完毕"，UI 显示正常结束，问题彻底看不见。
+                // packet 必须逐个新建：它会被 move 进通道交给解码线程
+                let mut invalid_streak = 0u32;
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         break 'source;
@@ -306,9 +357,11 @@ pub fn spawn_demux_thread(ctx: DemuxCtx) -> std::thread::JoinHandle<()> {
                     if let Some(w) = watchdog.as_ref() {
                         w.refresh();
                     }
-                    match iter.next() {
-                        Some((stream, packet)) => {
-                            let idx = stream.index();
+                    let mut packet = ffmpeg_next::Packet::empty();
+                    match packet.read(&mut ictx) {
+                        Ok(()) => {
+                            invalid_streak = 0;
+                            let idx = packet.stream();
                             if Some(idx) == video_index {
                                 // 视频是必需的：视频消费端退出后整个源没有继续意义
                                 if video_tx
@@ -339,7 +392,33 @@ pub fn spawn_demux_thread(ctx: DemuxCtx) -> std::thread::JoinHandle<()> {
                                 }
                             }
                         }
-                        None => break 'read None, // EOF 或读取错误（迭代器内部已处理）
+                        Err(ffmpeg_next::Error::Eof) => break 'read None, // 正常播完
+                        // 单个坏包：跳过继续读（demuxer 能重新同步）。
+                        // 这类错误不算致命，不该让整个源提前结束；但连续出现
+                        // 说明 demuxer 已经无法前进，必须设上限，否则空转
+                        Err(ffmpeg_next::Error::InvalidData) => {
+                            invalid_streak += 1;
+                            if invalid_streak >= MAX_INVALID_STREAK {
+                                warn!(
+                                    "demux: {invalid_streak} consecutive corrupt packets; ending source"
+                                );
+                                if let Some(stats) = stats.as_ref() {
+                                    stats.read_errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                                break 'read None;
+                            }
+                            continue;
+                        }
+                        // 真正的读错误（网络中断、磁盘错误等）：错误被 AVIOContext
+                        // 粘住（pb->error），重试只会 100% CPU 空转，必须结束本源。
+                        // 但它不是 EOF：要单独计数 + 记日志，否则表现和"播完了"一样
+                        Err(e) => {
+                            warn!("demux read error: {e}");
+                            if let Some(stats) = stats.as_ref() {
+                                stats.read_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                            break 'read None;
+                        }
                     }
                 }
             };
@@ -356,9 +435,17 @@ pub fn spawn_demux_thread(ctx: DemuxCtx) -> std::thread::JoinHandle<()> {
                         w.refresh();
                     }
                     let ts = seek_timestamp_us(target_sec, timeline_origin);
-                    let lo = ts.saturating_sub(250_000);
-                    let hi = ts.saturating_add(250_000);
-                    if ictx.seek(ts, lo..hi).is_ok() {
+                    // 搜索范围必须放开下界（等价 ffmpeg.c 的
+                    // avformat_seek_file(ic, -1, -INT64_MAX, ts, ts, 0)）。
+                    // avformat_seek_file 的 min_ts/max_ts 不是"容差"，而是
+                    // **关键帧搜索窗口**：给一个有界下界（如 ts-250ms）时，
+                    // FFmpeg 会向前找第一个 pts >= min_ts 的关键帧，于是
+                    // 定位点变成"下一个关键帧"而不是"上一个关键帧"——
+                    // 误差最大一整个 GOP（10s GOP 的片子误差可达 +10s），
+                    // 且文件末尾附近向后已无关键帧时定位直接失败、seek 无效。
+                    // 下界放开后 FFmpeg 回退到 <= ts 的最近关键帧，
+                    // 关键帧之间的偏差由解码端 rebase 到实际帧 pts 修正。
+                    if ictx.seek(ts, seek_range_us(ts)).is_ok() {
                         info!("Seek to {:.2}s", target_sec);
                         SeekOutcome::Reset
                     } else {
@@ -380,9 +467,11 @@ pub fn spawn_demux_thread(ctx: DemuxCtx) -> std::thread::JoinHandle<()> {
             // 唤醒暂停中的解码线程，让它们立即看到处理结果
             paused.wake();
             // 3) 等解码线程处理完（复位完成，或确认无需复位），再继续发包，
-            //    保证 seek 后的新 packet 不会与旧 packet 混入解码管线
+            //    保证 seek 后的新 packet 不会与旧 packet 混入解码管线。
+            //    超时不等：解码线程异常退出时屏障可能永远不满足，
+            //    宁可让新旧包短暂交错，也不能把整个源挂死
             ctl.wait_ready(e);
-            // 继续 'source：重建 packet 迭代器（读位置已更新）
+            // 继续 'source：读位置已更新，下一轮从新位置继续 av_read_frame
         }
         // 循环结束（EOF/错误）后 sender 随线程退出而 drop，
         // 解码线程的 recv 返回 Err，触发各自的 flush 收尾。
@@ -425,6 +514,14 @@ pub fn timeline_origin(starts: &[(i64, ffmpeg_next::Rational)]) -> f64 {
 // 这里统一把两者换算，避免两处各写一遍（也方便单测）。
 pub fn seek_timestamp_us(target_sec: f64, origin_sec: f64) -> i64 {
     ((target_sec + origin_sec) * 1_000_000.0).round() as i64
+}
+
+// avformat_seek_file 的关键帧搜索窗口。下界必须放开（i64::MIN）：有界下界
+// 会让 FFmpeg 向前找第一个 >= 下界的关键帧，定位到"下一个关键帧"而不是
+// "上一个关键帧"，误差最大一整个 GOP；文件末尾附近还会直接定位失败。
+// 上界取目标本身，与 ffmpeg.c 的 -ss 精确定位一致。
+pub fn seek_range_us(ts: i64) -> std::ops::Range<i64> {
+    i64::MIN..ts
 }
 
 // 直接从 AVCodecParameters 读宽高与 SAR，避免只为拿显示尺寸而打开一个临时
@@ -682,6 +779,41 @@ mod tests {
         ctl.wait_ready(e); // 若未移除，这里会永久阻塞
     }
 
+    // 过期代数的就绪回报不能把屏障代数拉回去：否则 demux 等待的那个
+    // 代数再也等不到（就绪屏障永久卡死，源整体挂住）
+    #[test]
+    fn stale_ready_report_does_not_rewind_barrier() {
+        let ctl = SeekCtl::new(1);
+        ctl.request(1.0);
+        let (e1, _) = ctl.snapshot_new(0).unwrap();
+        ctl.report_ready(e1);
+        ctl.request(2.0);
+        let (e2, _) = ctl.snapshot_new(e1).unwrap();
+        ctl.report_ready(e2);
+        // 迟到的旧代数回报：必须被忽略，不能把 epoch 拉回 e1
+        ctl.report_ready(e1);
+        assert!(
+            ctl.wait_ready(e2),
+            "过期回报不能回退就绪代数，否则屏障永远等不到"
+        );
+    }
+
+    // 屏障等待必须有超时：解码线程全部异常退出时也不能把 demux 永久挂住
+    #[test]
+    fn ready_barrier_times_out_instead_of_hanging() {
+        let ctl = SeekCtl::new(2);
+        ctl.request(1.0);
+        let (e, _) = ctl.snapshot_new(0).unwrap();
+        // 一个线程都没就绪：wait_ready 必须超时返回，而不是永远阻塞
+        let start = Instant::now();
+        let ok = ctl.wait_ready_timeout(e, std::time::Duration::from_millis(50));
+        assert!(!ok, "没有线程就绪时不应报告成功");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "屏障等待必须有上限"
+        );
+    }
+
     // 时间轴原点取各流最早的 start_time；NOPTS / 非法 time_base 必须忽略。
     // 数值取自实测的 MPEG-TS：start_time 1.4s（126000 @ 1/90000）
     #[test]
@@ -706,5 +838,19 @@ mod tests {
     fn seek_timestamp_adds_origin() {
         assert_eq!(seek_timestamp_us(2.0, 0.0), 2_000_000);
         assert_eq!(seek_timestamp_us(2.0, 11.376_778), 13_376_778);
+    }
+
+    // 关键帧搜索窗口的下界必须放开：avformat_seek_file 的 min_ts 不是"容差"，
+    // 而是**关键帧搜索窗口**。给了有界下界（如 ts-250ms），FFmpeg 会向前找
+    // 第一个 >= 下界的关键帧 → 定位到"下一个关键帧"而非"上一个"，
+    // 误差最大一整个 GOP；文件末尾附近还会直接定位失败、seek 完全无效。
+    #[test]
+    fn seek_range_leaves_lower_bound_open() {
+        let r = seek_range_us(2_000_000);
+        assert_eq!(r.start, i64::MIN, "下界必须放开，否则会跳到下一个关键帧");
+        assert_eq!(
+            r.end, 2_000_000,
+            "上界取目标本身（与 ffmpeg.c 的 -ss 一致）"
+        );
     }
 }

@@ -9,7 +9,7 @@ use std::{
 
 use ffmpeg_next::util::color::{Primaries, Range, Space, TransferCharacteristic};
 use fltk::{prelude::*, window::GlWindow};
-use log::error;
+use log::{error, warn};
 
 use crate::{
     dmabuf::DmaBufFrame,
@@ -65,11 +65,15 @@ pub struct RenderState {
     // 截图请求：DMA-BUF 帧没有 CPU 平面，改在绘制后用 glReadPixels 取回
     snap_request: Arc<AtomicBool>,
     // 时间 OSD：最小纯色 program + 独立 VAO/VBO；顶点只在文字/窗口尺寸变化时重建
-    text_program: u32,
+    // 时间叠层的 program：编译失败时为 None（只影响 OSD，不影响视频）
+    text_program: Option<u32>,
     text_vao: u32,
     text_vbo: u32,
     text_color_loc: i32,
     text_cache: RefCell<TextCache>,
+    // 是否已经释放过 GL/EGL 资源：GL 对象必须在上下文销毁前删除，
+    // 因此由 Player 在删窗口前显式调用 cleanup()；Drop 只做兜底
+    cleaned: Cell<bool>,
 }
 
 // 已上传到 text_vbo 的 OSD 顶点：文字或窗口尺寸变化时才重建
@@ -79,6 +83,11 @@ struct TextCache {
     h: i32,
     verts: usize,
 }
+
+// 保留区（已提交绘制、GPU 可能仍在采样的 DMA-BUF 帧）最多同时存在多少帧。
+// 保留区满时不再导入新帧（见 draw_frame），而不是强制释放最老的一帧——
+// 强制释放会把仍被 GPU 采样的 surface 提前还给解码器，造成撕裂/花屏。
+const MAX_RETAINED_DMABUF: usize = 3;
 
 // 一个正在被 GPU 采样的 DMA-BUF 帧、其 EGLImage 与完成信号。
 // EGLImage 在当前帧绘制期间一直被纹理引用；fence 触发后销毁时，
@@ -96,46 +105,30 @@ struct RetainedDmaBuf {
 /// # Safety
 /// 调用方必须已让当前线程持有有效的 OpenGL 上下文（通常是窗口的
 /// `make_current()` 之后），并在同一线程上使用返回的 `RenderState`。
-pub unsafe fn setup_opengl(snap_request: Arc<AtomicBool>) -> RenderState {
+/// 着色器编译/链接失败时返回 None：此时不能继续绘制（黑屏且无从排查）。
+pub unsafe fn setup_opengl(snap_request: Arc<AtomicBool>) -> Option<RenderState> {
     unsafe {
         let shader_program = build_program(
             include_str!("shaders/basic.vert.glsl"),
             include_str!("shaders/basic.frag.glsl"),
-        );
+        )?;
 
         gl::UseProgram(shader_program);
-        let cmat_loc =
-            gl::GetUniformLocation(shader_program, CString::new("cmat").unwrap().as_ptr());
-        let y_params_loc =
-            gl::GetUniformLocation(shader_program, CString::new("yParams").unwrap().as_ptr());
-        let uv_params_loc =
-            gl::GetUniformLocation(shader_program, CString::new("uvParams").unwrap().as_ptr());
-        let hdr_mode_loc =
-            gl::GetUniformLocation(shader_program, CString::new("hdrMode").unwrap().as_ptr());
-        let hdr_primaries_loc = gl::GetUniformLocation(
-            shader_program,
-            CString::new("hdrPrimaries").unwrap().as_ptr(),
-        );
-        let semi_planar_loc =
-            gl::GetUniformLocation(shader_program, CString::new("semiPlanar").unwrap().as_ptr());
+        let cmat_loc = uniform_loc(shader_program, "cmat");
+        let y_params_loc = uniform_loc(shader_program, "yParams");
+        let uv_params_loc = uniform_loc(shader_program, "uvParams");
+        let hdr_mode_loc = uniform_loc(shader_program, "hdrMode");
+        let hdr_primaries_loc = uniform_loc(shader_program, "hdrPrimaries");
+        let semi_planar_loc = uniform_loc(shader_program, "semiPlanar");
         // 初始默认 full range，避免首帧前出现全黑/灰屏
         gl::Uniform2f(y_params_loc, 1.0, 0.0);
         gl::Uniform2f(uv_params_loc, 1.0, -0.5);
         gl::Uniform1i(hdr_mode_loc, 0);
         gl::Uniform1i(hdr_primaries_loc, 0);
         gl::Uniform1i(semi_planar_loc, 0);
-        gl::Uniform1i(
-            gl::GetUniformLocation(shader_program, CString::new("texY").unwrap().as_ptr()),
-            0,
-        );
-        gl::Uniform1i(
-            gl::GetUniformLocation(shader_program, CString::new("texU").unwrap().as_ptr()),
-            1,
-        );
-        gl::Uniform1i(
-            gl::GetUniformLocation(shader_program, CString::new("texV").unwrap().as_ptr()),
-            2,
-        );
+        gl::Uniform1i(uniform_loc(shader_program, "texY"), 0);
+        gl::Uniform1i(uniform_loc(shader_program, "texU"), 1);
+        gl::Uniform1i(uniform_loc(shader_program, "texV"), 2);
         let vertices: [f32; 16] = [
             1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, -1.0, -1.0, 0.0, 0.0, -1.0, 1.0, 0.0, 1.0,
         ];
@@ -203,14 +196,16 @@ pub unsafe fn setup_opengl(snap_request: Arc<AtomicBool>) -> RenderState {
         gl::BindTexture(gl::TEXTURE_2D, textures[2]);
 
         // 时间 OSD：独立的最小 program + VAO/VBO（顶点为 NDC 坐标，纯色着色）。
-        // 与视频共用上下文，但属性布局不同，必须是另一个 VAO
+        // 与视频共用上下文，但属性布局不同，必须是另一个 VAO。
+        // OSD 着色器失败不影响视频：只是不画时间叠层
         let text_program = build_program(
             include_str!("shaders/overlay.vert.glsl"),
             include_str!("shaders/overlay.frag.glsl"),
         );
-        gl::UseProgram(text_program);
-        let text_color_loc =
-            gl::GetUniformLocation(text_program, CString::new("uColor").unwrap().as_ptr());
+        let text_color_loc = text_program.map_or(-1, |p| uniform_loc(p, "uColor"));
+        if let Some(p) = text_program {
+            gl::UseProgram(p);
+        }
         let mut text_vao = 0;
         let mut text_vbo = 0;
         gl::GenVertexArrays(1, &mut text_vao);
@@ -274,9 +269,10 @@ pub unsafe fn setup_opengl(snap_request: Arc<AtomicBool>) -> RenderState {
                 h: 0,
                 verts: 0,
             }),
+            cleaned: Cell::new(false),
         };
         check_gl_error("setup_opengl");
-        state
+        Some(state)
     }
 }
 
@@ -284,6 +280,11 @@ pub unsafe fn setup_opengl(snap_request: Arc<AtomicBool>) -> RenderState {
 // 纹理存储只在尺寸变化时重新分配；此后每帧把数据写进 PBO（CPU 快速拷贝），
 // 再 TexSubImage2D 让 GPU 异步 DMA 到纹理，三缓冲 + fence 避免 CPU 阻塞等待上传。
 pub fn draw_frame(w: &mut GlWindow, state: &RenderState, frame: &YuvFrame) {
+    // cleanup() 之后 GL 对象已删除（源结束/换窗口），但队列里可能还有重绘：
+    // 再拿已删除的 program/VAO/纹理解引用是未定义行为
+    if state.cleaned.get() {
+        return;
+    }
     unsafe {
         // 文本 OSD 会切换 program/VAO，这里显式恢复视频路径的绑定
         gl::UseProgram(state.program);
@@ -381,8 +382,24 @@ pub fn draw_frame(w: &mut GlWindow, state: &RenderState, frame: &YuvFrame) {
             if let Some(dma) = frame.dmabuf() {
                 // DMA-BUF 零拷贝：直接把各平面导入成纹理，不经过 PBO/客户端内存。
                 // 导入失败时全局退回下载路径，下一帧会走下面的 CPU 上传分支。
-                state.last_gen.set(frame.frame_gen);
-                imported = state.import_dmabuf(dma);
+                //
+                // 保留区满时**不导入**：里面的帧 GPU 可能还在采样，强制释放会让
+                // 解码器复用仍被读取的 surface（撕裂/花屏）。此时本帧跳过，
+                // 屏幕保持上一帧，等 fence 触发后再导入下一帧。
+                if state.dmabuf_slot_available() {
+                    match state.import_dmabuf(dma) {
+                        Some(ok) => {
+                            state.last_gen.set(frame.frame_gen);
+                            imported = Some(ok);
+                        }
+                        None => {
+                            // 导入失败：import_dmabuf 内部已全局关闭零拷贝路径，
+                            // 视频线程从下一帧起改走 CPU 上传。本帧作废。
+                            state.last_gen.set(frame.frame_gen);
+                        }
+                    }
+                }
+                // 保留区满：跳过本帧，不推进 last_gen——下一帧到达时会再试
             } else {
                 let cur = state.pbo_cur.get();
 
@@ -459,6 +476,7 @@ pub fn draw_frame(w: &mut GlWindow, state: &RenderState, frame: &YuvFrame) {
                     state.pbo_cur.set((cur + 1) % 3);
 
                     gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
+                    check_gl_error("upload_frame");
                 } else {
                     // 槽位仍忙：纹理保持上一帧。必须主动再排一次重绘，否则只有
                     // 下一帧到来才会重试，这一帧就被静默丢掉了。重试本身受
@@ -468,8 +486,8 @@ pub fn draw_frame(w: &mut GlWindow, state: &RenderState, frame: &YuvFrame) {
             }
         }
 
-        gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
         gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, std::ptr::null());
+        check_gl_error("draw_frame");
 
         // DMA-BUF 帧的 surface 要活到 GPU 采样完成：提交 fence 后保留，
         // 后续绘制时按 fence 状态回收（见 release_finished_dmabuf）
@@ -491,7 +509,7 @@ pub fn draw_frame(w: &mut GlWindow, state: &RenderState, frame: &YuvFrame) {
 // 右上角时间 OSD：文字画成一组 NDC 矩形（3×5 点阵），带半透明底衬。
 // 放在视频之后、swap 之前；截图读回在 draw_frame 内部完成，因此不会把 OSD 拍进去。
 pub fn draw_time_overlay(w: &GlWindow, state: &RenderState, text: &str) {
-    if text.is_empty() {
+    if text.is_empty() || state.cleaned.get() {
         return;
     }
     let (win_w, win_h) = (w.pixel_w(), w.pixel_h());
@@ -520,7 +538,10 @@ pub fn draw_time_overlay(w: &GlWindow, state: &RenderState, text: &str) {
 
         // 视口恢复成整个窗口（draw_frame 把它设成了视频区域）
         gl::Viewport(0, 0, win_w, win_h);
-        gl::UseProgram(state.text_program);
+        let Some(text_program) = state.text_program else {
+            return; // OSD 着色器编译失败：不画时间叠层，视频照常
+        };
+        gl::UseProgram(text_program);
         gl::BindVertexArray(state.text_vao);
         gl::Enable(gl::BLEND);
         gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
@@ -609,9 +630,17 @@ impl RenderState {
     // 把一帧 DMA-BUF 的所有平面导入成纹理。全部成功才真正绑定；
     // 任一步失败则销毁已建 EGLImage 并让视频线程退回下载路径。
     fn import_dmabuf(&self, frame: &DmaBufFrame) -> Option<(DmaBufFrame, Vec<EGLImage>)> {
-        let egl = self.egl.as_ref()?;
+        let Some(egl) = self.egl.as_ref() else {
+            // 没有 EGL 导入器却收到了 DMA-BUF 帧：必须全局关闭零拷贝路径。
+            // 不关的话视频线程会一直产出这种帧、每帧都在这里被丢掉 → 画面永久冻结
+            egl::disable("no EGL interop for DMA-BUF frame");
+            return None;
+        };
         // 先 retain：EGLImage 创建与绘制期间 surface 不能被解码器回收
-        let retained = frame.retain()?;
+        let Some(retained) = frame.retain() else {
+            egl::disable("av_frame_ref(DRM_PRIME) failed");
+            return None;
+        };
         let mut images: Vec<(usize, EGLImage)> = Vec::with_capacity(3);
         for (i, plane) in frame.planes.iter().enumerate() {
             let Some(plane) = plane else { continue };
@@ -629,7 +658,8 @@ impl RenderState {
             return None;
         }
         for (i, image) in &images {
-            if !unsafe { egl.bind_image(self.textures[*i], *image) } {
+            // 平面序号同时对应纹理与采样单元（Y=0, U/UV=1, V=2）
+            if !unsafe { egl.bind_image(*i as u32, self.textures[*i], *image) } {
                 // 已经绑定到纹理的 EGLImage 不能立刻销毁（纹理仍引用其存储）；
                 // 全局退回 CPU 路径后这些是最后一次，直接泄漏也比 UAF 安全
                 warn_once_bind_failure();
@@ -646,23 +676,45 @@ impl RenderState {
         }
         // 纹理存储已由 EGLImage 定义；下次 CPU 帧必须重新 TexImage2D
         self.tex_size.set((-1, -1, 0, false));
+        // bind_image 已把每个平面绑定到自己的采样单元（unit = 平面序号）；
+        // 半平面只导入 unit 0/1，unit 2 从 setup 起就一直绑定 textures[2]，
+        // 无需再整轮重绑
         Some((retained, images.into_iter().map(|(_, img)| img).collect()))
     }
 
-    // 回收已完成采样的 DMA-BUF 帧（fence 触发后），并限制最多保留 3 帧
+    // 回收已完成采样的 DMA-BUF 帧（fence 触发后）。
+    //
+    // 两条硬约束：
+    // 1) fence 没触发就不能回收——解码器会立刻复用仍被 GPU 采样的 surface，
+    //    画面出现撕裂/花屏。堆积到上限时改为**不再导入新帧**（见 draw_frame），
+    //    绝不强制释放最老的一帧。
+    // 2) 列表最后一个（最近一次导入）不能回收：纹理的存储仍指向它的 EGLImage，
+    //    提前销毁会让后续绘制采样已释放的存储（未定义行为）。它要等下一次
+    //    导入替换纹理存储后才可回收。
     fn release_finished_dmabuf(&self) {
         let mut retained = self.dmabuf_retained.borrow_mut();
         let mut i = 0;
-        while i < retained.len() {
+        // 条件里每轮重新取 len：remove(i) 会让后面的元素前移。用固定的
+        // end 会越界（i >= len → panic），或把列表最后一个误当成普通条目
+        // 释放——而最后一个仍被纹理引用，销毁其 EGLImage 就是 UAF
+        while i + 1 < retained.len() {
             let fence = retained[i].fence;
             let done = if fence.is_null() {
                 true
             } else {
                 let s = unsafe { gl::ClientWaitSync(fence, 0, 0) };
-                matches!(
-                    s,
-                    gl::ALREADY_SIGNALED | gl::CONDITION_SATISFIED | gl::WAIT_FAILED
-                )
+                match s {
+                    gl::ALREADY_SIGNALED | gl::CONDITION_SATISFIED => true,
+                    gl::TIMEOUT_EXPIRED => false,
+                    // WAIT_FAILED 表示 sync 已失效（上下文丢失/对象无效），
+                    // 无法再确认完成状态。若一直按"未完成"处理，保留区会永久
+                    // 占满、不再导入新帧 → 画面永久冻结。因此按已完成处理
+                    // （与 wait_fence 的 Invalid 分支一致），代价是极小概率撕裂
+                    _ => {
+                        warn_once_invalid_fence();
+                        true
+                    }
+                }
             };
             if done {
                 let r = retained.remove(i);
@@ -671,12 +723,11 @@ impl RenderState {
                 i += 1;
             }
         }
-        // 极端积压：最多保留 3 帧（与 PBO 三缓冲一致），最老的强制释放，
-        // 否则解码器的 surface 池会被一直占住而停摆
-        while retained.len() > 3 {
-            let r = retained.remove(0);
-            self.free_retained(r);
-        }
+    }
+
+    // 保留区是否还有空槽：没有的话不能再导入新帧
+    fn dmabuf_slot_available(&self) -> bool {
+        self.dmabuf_retained.borrow().len() < MAX_RETAINED_DMABUF
     }
 
     fn free_retained(&self, r: RetainedDmaBuf) {
@@ -698,6 +749,7 @@ impl RenderState {
             return;
         }
         if w <= 0 || h <= 0 {
+            warn!("Screenshot skipped: invalid viewport {w}x{h}");
             return;
         }
         let mut rgb = vec![0u8; w as usize * h as usize * 3];
@@ -714,20 +766,82 @@ impl RenderState {
                 rgb.as_mut_ptr() as *mut _,
             );
         }
+        // glReadPixels 没有返回值，失败只体现在 GL 错误队列里。
+        // 不检查就写文件 → 读回失败时会存出一张全黑 PNG，还提示"已保存"
+        let err = unsafe { gl::GetError() };
+        if err != gl::NO_ERROR {
+            error!("glReadPixels failed (0x{err:x}); screenshot discarded");
+            return;
+        }
         crate::screenshot::spawn_save_rgb(w, h, rgb);
+    }
+
+    // 在 GL 上下文仍然有效时释放全部 GL/EGL 资源。
+    //
+    // 必须在窗口（连同 GL 上下文）销毁之前调用：上下文没了之后再调
+    // glDelete*/eglDestroyImageKHR 是未定义行为（驱动可能已卸载该上下文）。
+    // 幂等：重复调用只生效一次。
+    pub fn cleanup(&self) {
+        if self.cleaned.get() {
+            return;
+        }
+        self.cleaned.set(true);
+        unsafe {
+            // fence 属于各自的 GL 上下文，先删
+            for f in self.fences.iter() {
+                let f = f.get();
+                if !f.is_null() {
+                    gl::DeleteSync(f);
+                }
+            }
+            // 纹理先删：删掉之后 EGLImage 的存储才不再被引用
+            gl::DeleteTextures(3, self.textures.as_ptr());
+            gl::DeleteBuffers(3, self.pbo.as_ptr());
+            gl::DeleteVertexArrays(1, &self.vao);
+            gl::DeleteVertexArrays(1, &self.text_vao);
+            gl::DeleteBuffers(1, &self.text_vbo);
+            if let Some(p) = self.text_program {
+                gl::DeleteProgram(p);
+            }
+            gl::DeleteProgram(self.program);
+            // EGLImage 最后销毁（此时纹理已不再引用其存储），
+            // 同时把保留帧交还解码器（DRM fd 随之释放）
+            if let Some(egl) = &self.egl {
+                for r in self.dmabuf_retained.borrow_mut().drain(..) {
+                    for img in &r.images {
+                        egl.destroy_image(*img);
+                    }
+                    if !r.fence.is_null() {
+                        gl::DeleteSync(r.fence);
+                    }
+                    drop(r.frame);
+                }
+            } else {
+                self.dmabuf_retained.borrow_mut().clear();
+            }
+        }
+    }
+
+    // 只释放不依赖 GL 上下文的部分（保留帧 → DRM fd 交还解码器）。
+    //
+    // 窗口已被用户关闭时用这个：此时上下文无法再激活（FLTK 的 make_current
+    // 对未显示的窗口会弹警告框并终止进程），调任何 GL/EGL 函数都没有意义。
+    // GL 对象随上下文销毁由驱动回收，EGLImage 走进程退出时的 EGL 清理。
+    pub fn release_without_context(&self) {
+        self.dmabuf_retained.borrow_mut().clear();
     }
 }
 
 impl Drop for RenderState {
     fn drop(&mut self) {
-        // 只销毁 EGLImage；此时 GL 上下文可能已删除，不再调用 GL 函数
-        if let Some(egl) = &self.egl {
-            for r in self.dmabuf_retained.get_mut() {
-                for img in &r.images {
-                    unsafe { egl.destroy_image(*img) };
-                }
-            }
+        if self.cleaned.get() {
+            return; // 已由 cleanup() 释放（上下文销毁前）
         }
+        // 兜底路径：没有显式清理就走到这里，说明 GL 上下文可能已经没了。
+        // 此时调 GL/EGL 是未定义行为，只能放弃——GL 对象会随上下文销毁
+        // 由驱动回收，DRM fd 则随保留帧的 AVFrame drop 释放
+        self.release_without_context();
+        warn!("RenderState dropped without cleanup(); GL resources left to the driver");
     }
 }
 
@@ -740,20 +854,36 @@ fn warn_once_bind_failure() {
     }
 }
 
-// GL 错误检查只在 debug 构建开启（GetError 会同步驱动，release 不付代价）。
-// 上传/绘制失败时静默保留上一帧很难排查，至少把错误码打出来。
-#[cfg(debug_assertions)]
-fn check_gl_error(context: &str) {
+// DMA-BUF 完成 fence 失效（WAIT_FAILED）只提示一次：之后每帧都会走到这里
+fn warn_once_invalid_fence() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    static REPORTED: AtomicBool = AtomicBool::new(false);
-    let e = unsafe { gl::GetError() };
-    if e != gl::NO_ERROR && !REPORTED.swap(true, Ordering::Relaxed) {
-        error!("GL error after {context}: 0x{e:x} (further errors suppressed)");
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "DMA-BUF completion fence is invalid (WAIT_FAILED); \
+             releasing retained frames to avoid a permanent freeze"
+        );
     }
 }
 
-#[cfg(not(debug_assertions))]
-fn check_gl_error(_context: &str) {}
+// GL 错误检查。release 下同样启用：驱动异常（纹理格式不匹配、UNPACK_ROW_LENGTH
+// 取负、上下文丢失）只表现为"画面不对/不动"，日志却干干净净，根本无从排查。
+// GetError 无错误时只是读一次客户端状态，代价可忽略。
+// 只报前几条：同一个错误每帧重复会刷爆日志，第一次的信息量最大。
+fn check_gl_error(context: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static REPORTED: AtomicUsize = AtomicUsize::new(0);
+    let e = unsafe { gl::GetError() };
+    if e == gl::NO_ERROR {
+        return;
+    }
+    let n = REPORTED.fetch_add(1, Ordering::Relaxed);
+    if n < 5 {
+        error!("GL error after {context}: 0x{e:x}");
+    } else if n == 5 {
+        error!("further GL errors suppressed (last: 0x{e:x} after {context})");
+    }
+}
 
 // 单个 PBO 槽位上一条 fence 的等待结果
 enum FenceState {
@@ -998,9 +1128,6 @@ unsafe fn upload_frame(state: &RenderState, cur: usize, frame: &YuvFrame, map_un
 
         for i in 0..n {
             let p = &planes[i];
-            if mapped {
-                gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, state.pbo[cur]);
-            }
             gl::ActiveTexture(p.unit);
             let bytes_per_pixel = p.dims.bytes_per_sample.max(1) * p.dims.channels.max(1);
             gl::PixelStorei(
@@ -1029,6 +1156,10 @@ unsafe fn upload_frame(state: &RenderState, cur: usize, frame: &YuvFrame, map_un
             );
         }
 
+        // 解绑：PBO 只用于像素上传，DrawElements 不需要它；
+        // 留在这里而不是 draw_frame，可以只在上传过的帧付这次调用
+        gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
+
         let done = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
         if !prev.is_null() {
             gl::DeleteSync(prev);
@@ -1045,8 +1176,10 @@ unsafe fn upload_frame(state: &RenderState, cur: usize, frame: &YuvFrame, map_un
     }
 }
 
-// 编译 + 链接一对 GLSL，返回 program。编译/链接失败只记日志（沿用原行为）
-unsafe fn build_program(vs_src: &str, fs_src: &str) -> u32 {
+// 编译 + 链接一对 GLSL。编译/链接失败返回 None：调用方必须放弃这个 program，
+// 不能继续 UseProgram——链接失败的 program 一切调用都是 GL_INVALID_OPERATION，
+// 结果是整块黑屏，而日志里只有一行 error，用户完全看不出发生了什么。
+unsafe fn build_program(vs_src: &str, fs_src: &str) -> Option<u32> {
     unsafe {
         let vs_src = CString::new(vs_src).unwrap();
         let fs_src = CString::new(fs_src).unwrap();
@@ -1054,12 +1187,12 @@ unsafe fn build_program(vs_src: &str, fs_src: &str) -> u32 {
         let vs = gl::CreateShader(gl::VERTEX_SHADER);
         gl::ShaderSource(vs, 1, &vs_src.as_ptr(), std::ptr::null());
         gl::CompileShader(vs);
-        log_shader_status(vs, "vertex");
+        let vs_ok = log_shader_status(vs, "vertex");
 
         let fs = gl::CreateShader(gl::FRAGMENT_SHADER);
         gl::ShaderSource(fs, 1, &fs_src.as_ptr(), std::ptr::null());
         gl::CompileShader(fs);
-        log_shader_status(fs, "fragment");
+        let fs_ok = log_shader_status(fs, "fragment");
 
         let program = gl::CreateProgram();
         gl::AttachShader(program, vs);
@@ -1067,13 +1200,29 @@ unsafe fn build_program(vs_src: &str, fs_src: &str) -> u32 {
         gl::LinkProgram(program);
         gl::DeleteShader(vs);
         gl::DeleteShader(fs);
-        log_program_status(program);
-        program
+        let link_ok = log_program_status(program);
+        if !vs_ok || !fs_ok || !link_ok {
+            gl::DeleteProgram(program);
+            return None;
+        }
+        Some(program)
     }
 }
 
-// 着色器编译/链接状态校验：失败时输出日志，避免驱动异常时静默黑屏难排查
-unsafe fn log_shader_status(shader: u32, label: &str) {
+// 取 uniform 位置并校验：位置为 -1 表示该 uniform 不存在（被改名或被优化掉），
+// 此时 glUniform* 是"合法的空操作"——画面参数悄悄不生效，却没有任何报错。
+unsafe fn uniform_loc(program: u32, name: &str) -> i32 {
+    unsafe {
+        let loc = gl::GetUniformLocation(program, CString::new(name).unwrap().as_ptr());
+        if loc < 0 {
+            error!("GL uniform '{name}' not found in shader");
+        }
+        loc
+    }
+}
+
+// 着色器编译/链接状态校验：失败时输出日志并返回 false
+unsafe fn log_shader_status(shader: u32, label: &str) -> bool {
     unsafe {
         let mut ok = 0;
         gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut ok);
@@ -1083,11 +1232,13 @@ unsafe fn log_shader_status(shader: u32, label: &str) {
                 label,
                 info_log(|len, written, buf| gl::GetShaderInfoLog(shader, len, written, buf))
             );
+            return false;
         }
+        true
     }
 }
 
-unsafe fn log_program_status(program: u32) {
+unsafe fn log_program_status(program: u32) -> bool {
     unsafe {
         let mut ok = 0;
         gl::GetProgramiv(program, gl::LINK_STATUS, &mut ok);
@@ -1096,7 +1247,9 @@ unsafe fn log_program_status(program: u32) {
                 "GL program link failed: {}",
                 info_log(|len, written, buf| gl::GetProgramInfoLog(program, len, written, buf))
             );
+            return false;
         }
+        true
     }
 }
 
